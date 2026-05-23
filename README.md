@@ -49,7 +49,13 @@ sudo apt install -y \
   gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad \
   gstreamer1.0-plugins-ugly \
-  gstreamer1.0-libav
+  gstreamer1.0-libav \
+  pkg-config \
+  libglib2.0-dev \
+  libjson-glib-dev \
+  libgstreamer1.0-dev \
+  libgstreamer-plugins-base1.0-dev \
+  libgstreamer-plugins-bad1.0-dev
 ```
 
 如果使用硬件编码，需要根据平台额外安装对应插件，例如：
@@ -93,6 +99,34 @@ cmake --build build -j
 --config <path>        配置文件路径，默认 config/default.yaml
 --help                 显示帮助
 ```
+
+### Python 接收端（兼容当前 C++ 发送端）
+
+仓库提供了 Python 版接收端脚本：`scripts/python_receiver.py`。  
+它使用 TCP JSON 行信令，协议字段与当前 C++ 版本一致（`sdpBase64` / `ice` / `metrics`）。
+
+1. 安装 Python 依赖：
+
+```bash
+python3 -m pip install aiortc
+```
+
+2. 启动 Python 接收端（默认监听 `127.0.0.1:9000`）：
+
+```bash
+python3 scripts/python_receiver.py --host 127.0.0.1 --port 9000
+```
+
+3. 另开终端启动 C++ 发送端：
+
+```bash
+./build/weaknet_webrtc --mode send --config config/default.yaml
+```
+
+可选参数：
+
+- `--record out.mp4`：把接收到的视频保存为文件；不传时默认丢弃媒体数据（用于纯链路/自适应联调）。
+- `--metrics-interval 1.0`：回传网络 metrics 的周期（秒），默认 1 秒。
 
 ## 本机 localhost 自收发测试
 
