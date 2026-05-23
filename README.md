@@ -55,7 +55,8 @@ sudo apt install -y \
   libjson-glib-dev \
   libgstreamer1.0-dev \
   libgstreamer-plugins-base1.0-dev \
-  libgstreamer-plugins-bad1.0-dev
+  libgstreamer-plugins-bad1.0-dev \
+  gstreamer1.0-nice
 ```
 
 如果使用硬件编码，需要根据平台额外安装对应插件，例如：
