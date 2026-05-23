@@ -110,6 +110,8 @@ cmake --build build -j
 
 ```bash
 python3 -m pip install aiortc
+# 如果需要 --preview / --visualize 实时预览：
+python3 -m pip install opencv-python
 ```
 
 2. 启动 Python 接收端（默认监听 `127.0.0.1:9000`）：
@@ -127,6 +129,7 @@ python3 scripts/python_receiver.py --host 127.0.0.1 --port 9000
 可选参数：
 
 - `--record out.mp4`：把接收到的视频保存为文件；不传时默认丢弃媒体数据（用于纯链路/自适应联调）。
+- `--preview` / `--visualize`：开启 OpenCV 实时画面预览，按 `q` 或 `Esc` 关闭预览窗口；首次使用需要安装 `opencv-python`。
 - `--metrics-interval 1.0`：回传网络 metrics 的周期（秒），默认 1 秒。
 
 ## 本机 localhost 自收发测试

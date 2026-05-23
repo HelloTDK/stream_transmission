@@ -8,10 +8,11 @@ import logging
 import signal
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from aiortc import RTCConfiguration, RTCIceCandidate, RTCIceServer, RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaBlackhole, MediaRecorder
+from aiortc.contrib.media import MediaBlackhole, MediaRecorder, MediaRelay
+from aiortc.mediastreams import MediaStreamError
 from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 
 
@@ -21,6 +22,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 LOG = logging.getLogger("python_receiver")
+logging.getLogger("aioice").setLevel(logging.WARNING)
 
 
 @dataclass
@@ -102,6 +104,34 @@ def encode_sdp_base64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("utf-8")
 
 
+def dump_sdp_summary(label: str, sdp: str) -> None:
+    interesting_prefixes = (
+        "m=",
+        "a=group:",
+        "a=mid:",
+        "a=setup:",
+        "a=fingerprint:",
+        "a=ice-ufrag:",
+        "a=ice-pwd:",
+        "a=candidate:",
+        "a=end-of-candidates",
+        "a=rtcp-mux",
+    )
+    LOG.info("%s SDP summary:", label)
+    for line in sdp.splitlines():
+        if line.startswith(interesting_prefixes):
+            LOG.info("  %s", line)
+
+
+def rewrite_sdp_setup_role(sdp: str, role: str) -> str:
+    if role == "auto":
+        return sdp
+    return "\r\n".join(
+        f"a=setup:{role}" if line.startswith("a=setup:") else line
+        for line in sdp.splitlines()
+    ) + "\r\n"
+
+
 def to_ms(value: Optional[float]) -> float:
     if value is None:
         return 0.0
@@ -177,6 +207,34 @@ async def metrics_loop(
         )
 
 
+async def preview_loop(track: Any, window_name: str) -> None:
+    try:
+        import cv2
+    except ImportError:
+        LOG.error("preview requires OpenCV: python3 -m pip install opencv-python")
+        return
+
+    LOG.info("video preview enabled: window=%s", window_name)
+    try:
+        while True:
+            frame = await track.recv()
+            image = frame.to_ndarray(format="bgr24")
+            cv2.imshow(window_name, image)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                LOG.info("preview window close requested")
+                break
+    except asyncio.CancelledError:
+        raise
+    except MediaStreamError:
+        LOG.info("preview track ended")
+    except Exception as exc:
+        LOG.warning("preview stopped: %s", exc)
+    finally:
+        with contextlib.suppress(Exception):
+            cv2.destroyWindow(window_name)
+
+
 async def run(args: argparse.Namespace) -> None:
     ice_servers = []
     if args.stun_server:
@@ -193,6 +251,11 @@ async def run(args: argparse.Namespace) -> None:
     signaling = TcpJsonLineSignaling(args.host, args.port)
     metrics_state = MetricsState()
     metrics_task: Optional[asyncio.Task] = None
+    preview_tasks: List[asyncio.Task] = []
+    preview_tracks: List[Any] = []
+    sink_tracks: List[Any] = []
+    relay = MediaRelay()
+    media_done = asyncio.Event()
 
     sink: Any
     if not args.record:
@@ -203,7 +266,11 @@ async def run(args: argparse.Namespace) -> None:
     @pc.on("icecandidate")
     def on_icecandidate(candidate: Optional[RTCIceCandidate]) -> None:
         if candidate is None:
+            if args.debug_ice:
+                LOG.info("local ICE gathering complete")
             return
+        if args.debug_ice:
+            LOG.info("local ICE candidate: %s", candidate_to_sdp(candidate).strip())
         asyncio.create_task(
             signaling.send(
                 {
@@ -217,7 +284,39 @@ async def run(args: argparse.Namespace) -> None:
     @pc.on("track")
     def on_track(track) -> None:
         LOG.info("remote track received: kind=%s id=%s", track.kind, track.id)
-        sink.addTrack(track)
+        if args.preview and track.kind == "video":
+            if args.record:
+                sink_track = relay.subscribe(track)
+                preview_track = relay.subscribe(track)
+                sink_tracks.append(sink_track)
+                preview_tracks.append(preview_track)
+                sink.addTrack(sink_track)
+                preview_tasks.append(asyncio.create_task(preview_loop(preview_track, args.preview_window)))
+            else:
+                preview_tasks.append(asyncio.create_task(preview_loop(track, args.preview_window)))
+        else:
+            sink_tracks.append(track)
+            sink.addTrack(track)
+
+        @track.on("ended")
+        async def on_ended() -> None:
+            LOG.info("remote track ended: kind=%s id=%s", track.kind, track.id)
+            media_done.set()
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange() -> None:
+        LOG.info("peer connection state: %s", pc.connectionState)
+        if pc.connectionState in {"failed", "closed"}:
+            media_done.set()
+
+    @pc.on("iceconnectionstatechange")
+    async def on_iceconnectionstatechange() -> None:
+        LOG.info("ICE connection state: %s", pc.iceConnectionState)
+
+    @pc.on("icegatheringstatechange")
+    async def on_icegatheringstatechange() -> None:
+        if args.debug_ice:
+            LOG.info("ICE gathering state: %s", pc.iceGatheringState)
 
     await signaling.start()
     await signaling.wait_connected()
@@ -233,15 +332,29 @@ async def run(args: argparse.Namespace) -> None:
 
             msg_type = message.get("type", "")
             if msg_type == "__eof__":
-                LOG.warning("signaling connection closed")
+                LOG.warning("signaling connection closed; keeping media alive until it ends or you press Ctrl+C")
+                if metrics_task is not None:
+                    metrics_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await metrics_task
+                    metrics_task = None
+                await media_done.wait()
                 break
             if msg_type == "sdp" and message.get("sdpType") == "offer":
                 offer_sdp = decode_sdp_base64(message.get("sdpBase64", ""))
+                if args.dump_sdp:
+                    dump_sdp_summary("remote offer", offer_sdp)
                 offer = RTCSessionDescription(sdp=offer_sdp, type="offer")
                 await pc.setRemoteDescription(offer)
 
                 answer = await pc.createAnswer()
+                answer_sdp = rewrite_sdp_setup_role(answer.sdp, args.dtls_role)
+                if args.dtls_role != "auto":
+                    LOG.warning("forcing DTLS setup role in answer SDP: %s", args.dtls_role)
+                answer = RTCSessionDescription(sdp=answer_sdp, type=answer.type)
                 await pc.setLocalDescription(answer)
+                if args.dump_sdp:
+                    dump_sdp_summary("local answer", pc.localDescription.sdp)
 
                 await signaling.send(
                     {
@@ -264,6 +377,8 @@ async def run(args: argparse.Namespace) -> None:
                 mline_index = int(message.get("mlineIndex", 0))
                 if not candidate_line:
                     continue
+                if args.debug_ice:
+                    LOG.info("remote ICE candidate: mline=%d %s", mline_index, candidate_line)
                 try:
                     raw_candidate = candidate_line.split(":", 1)[1] if ":" in candidate_line else candidate_line
                     candidate = candidate_from_sdp(raw_candidate)
@@ -278,6 +393,18 @@ async def run(args: argparse.Namespace) -> None:
             metrics_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await metrics_task
+        for track in preview_tracks:
+            with contextlib.suppress(Exception):
+                track.stop()
+        for track in sink_tracks:
+            with contextlib.suppress(Exception):
+                track.stop()
+        await asyncio.sleep(0)
+        for task in preview_tasks:
+            task.cancel()
+        for task in preview_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         await sink.stop()
         await pc.close()
         await signaling.close()
@@ -293,9 +420,36 @@ def parse_args() -> argparse.Namespace:
         help="Optional output file path (e.g. out.mp4). Empty means discard media.",
     )
     parser.add_argument(
+        "--preview",
+        "--visualize",
+        action="store_true",
+        help="Show the received video in a real-time OpenCV preview window. Press q or Esc to close the preview.",
+    )
+    parser.add_argument(
+        "--preview-window",
+        default="python_receiver",
+        help="OpenCV preview window title (default: python_receiver)",
+    )
+    parser.add_argument(
+        "--debug-ice",
+        action="store_true",
+        help="Log ICE gathering/connection details for troubleshooting.",
+    )
+    parser.add_argument(
+        "--dump-sdp",
+        action="store_true",
+        help="Log the SDP fields relevant to ICE/DTLS troubleshooting.",
+    )
+    parser.add_argument(
+        "--dtls-role",
+        choices=("auto", "active", "passive"),
+        default="auto",
+        help="Override answer SDP a=setup role for DTLS troubleshooting (default: auto).",
+    )
+    parser.add_argument(
         "--stun-server",
         default="stun:stun.l.google.com:19302",
-        help="STUN server URL, empty to disable",
+        help="STUN server URL. Use --stun-server \"\" to disable for LAN-only tests.",
     )
     parser.add_argument("--turn-server", default="", help="TURN server URL, optional")
     parser.add_argument("--turn-username", default="", help="TURN username, optional")
