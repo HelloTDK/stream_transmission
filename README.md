@@ -2,7 +2,7 @@
 
 本项目是面向 **远距离、高干扰、高丢包图像传输** 场景的 C++17 / GStreamer / WebRTC 工程骨架。设计目标是：在网络质量很差时优先保证图像不中断、可识别；在网络质量较好时尽可能利用带宽提升画质。
 
-> 当前仓库按 Linux 部署环境设计。你当前是在 Windows 下准备代码，因此本轮没有做本地编译。
+> 当前仓库按 Linux 部署环境设计。
 
 ## 技术路线
 
@@ -11,7 +11,7 @@
 - 默认编码：H.264，示例使用 `x264enc`
 - 弱网策略：码率、分辨率、帧率动态降级
 - 抗丢包策略：WebRTC NACK/PLI/FIR/RTCP 反馈 + 编码器关键帧保护 + 保底图像通道预留
-- 信令方式：当前提供控制台 JSON 行信令，后续可替换为 WebSocket/MQTT/自研链路
+- 信令方式：默认使用本机 TCP JSON 行信令，也支持控制台手动 JSON 行信令；后续可替换为 WebSocket/MQTT/自研链路
 
 ## 目录结构
 
@@ -29,7 +29,7 @@
     ├── app/               # 应用入口编排
     ├── config/            # 配置加载
     ├── media/             # WebRTC 发送端/接收端
-    ├── signaling/         # 控制台信令
+    ├── signaling/         # TCP/控制台 JSON 行信令
     └── util/              # 日志和 JSON 辅助
 ```
 
@@ -67,18 +67,23 @@ cmake --build build -j
 
 ## 运行方式
 
-当前版本使用“控制台 JSON 行信令”。发送端和接收端需要把彼此的标准输入/输出通过外部信令程序、管道或终端复制连接起来。工程中这样设计，是为了先把 WebRTC 媒体链路、弱网控制和编码策略做干净，后续再替换成真实 WebSocket 信令。
+当前版本内置两种 JSON 行信令方式：
 
-发送端：
+- 默认：`config/default.yaml` 中 `signaling.url: tcp://127.0.0.1:9000`，接收端监听 TCP，发送端连接 TCP。
+- 回退：把 `signaling.url` 留空后，使用控制台 stdin/stdout 手动复制 JSON 行。
 
-```bash
-./build/weaknet_webrtc --mode send --config config/default.yaml
-```
+默认配置下应先启动接收端，再启动发送端。
 
 接收端：
 
 ```bash
 ./build/weaknet_webrtc --mode recv --config config/default.yaml
+```
+
+发送端：
+
+```bash
+./build/weaknet_webrtc --mode send --config config/default.yaml
 ```
 
 命令行参数：
@@ -91,7 +96,19 @@ cmake --build build -j
 
 ## 本机 localhost 自收发测试
 
-这一节用于先在同一台 Linux 机器上验证“发送端产生测试视频，接收端能显示画面”。默认配置使用 `videotestsrc`，不需要真实摄像头。
+这一节用于先在同一台 Linux 机器上验证“发送端产生视频，接收端能显示画面”。当前默认配置使用 `uridecodebin` 读取本地文件：
+
+```yaml
+video:
+  source: uridecodebin uri=file:///home/cjj/streaming_transmission/1.mp4
+```
+
+如果你的机器上没有这个文件，先把 `video.source` 改成自己的本地视频文件，或改回测试源：
+
+```yaml
+video:
+  source: videotestsrc is-live=true pattern=ball
+```
 
 ### 1. 安装依赖
 
@@ -140,43 +157,80 @@ cmake --build build -j
 ./build/weaknet_webrtc --mode send --config config/default.yaml
 ```
 
-### 4. 手动交换控制台信令
+### 4. 自动 TCP 信令
 
-当前还没有 WebSocket 信令服务器，所以需要手动复制两边 stdout 输出的 JSON 行。日志是 `[INFO]` / `[WARN]` / `[ERROR]`，不要复制日志，只复制以 `{` 开头、以 `}` 结尾的整行 JSON。
+默认配置下不需要手动复制 offer、answer、ICE 或 metrics。接收端会监听 `127.0.0.1:9000`，发送端会自动连接；连接建立后，信令消息和接收端 metrics 都会通过这个 TCP 连接传递。
+
+接收端日志中应能看到：
+
+```text
+TCP 信令监听中: 127.0.0.1:9000
+TCP 信令已连接。
+```
+
+发送端日志中应能看到：
+
+```text
+TCP 信令已连接: 127.0.0.1:9000
+已发送 offer。
+```
+
+### 5. 手动控制台信令
+
+如果需要手动复制 JSON 行，把配置里的 `signaling.url` 改为空：
+
+```yaml
+signaling:
+  url:
+```
+
+然后启动接收端和发送端。日志是 `[INFO]` / `[WARN]` / `[ERROR]`，不要复制日志，只复制以 `{` 开头、以 `}` 结尾的整行 JSON。
 
 基本顺序：
 
 1. 从发送端终端 B 复制 `{"type":"sdp","sdpType":"offer",...}` 整行，粘贴到接收端终端 A，然后回车。
 2. 从接收端终端 A 复制 `{"type":"sdp","sdpType":"answer",...}` 整行，粘贴到发送端终端 B，然后回车。
 3. 两边后续可能继续输出 `{"type":"ice",...}`，把发送端的 ICE 复制到接收端，把接收端的 ICE 复制到发送端。
-4. 协商成功后，接收端应弹出视频窗口，显示默认测试球画面。
+4. 协商成功后，接收端应弹出视频窗口。
 
-连接建立后，接收端会周期性输出 `{"type":"metrics",...}`。这些 metrics 也需要复制给发送端，发送端才会根据丢包率、RTT、jitter 和带宽估算做自适应调节。手动复制适合本机验证，后续生产版本应替换为 WebSocket/MQTT 信令。
+连接建立后，接收端会周期性输出 `{"type":"metrics",...}`。这些 metrics 也需要复制给发送端，发送端才会根据丢包率、RTT、jitter 和带宽估算做自适应调节。
 
-### 5. 本机测试配置建议
+### 6. 本机测试配置建议
 
-本机自收发时可以先保持默认配置：
+本机自收发时可以使用默认 TCP 信令配置：
 
 ```yaml
-video:
-  source: videotestsrc is-live=true pattern=ball
-  max_bitrate_kbps: 2000
-
 app:
   stun_server: stun://stun.l.google.com:19302
   turn_server:
+
+signaling:
+  url: tcp://127.0.0.1:9000
+
+video:
+  source: uridecodebin uri=file:///home/cjj/streaming_transmission/1.mp4
+  max_bitrate_kbps: 2000
 ```
 
 同一台机器或同一局域网测试通常不依赖 TURN。`stun_server` 只用于 WebRTC NAT 穿透辅助，不是视频服务器地址。
 
-### 6. 常见问题
+如果只想验证链路、不依赖本地视频文件，可以把 `video.source` 改成：
+
+```yaml
+video:
+  source: videotestsrc is-live=true pattern=ball
+```
+
+### 7. 常见问题
 
 如果没有视频窗口，先检查：
 
 - `gst-inspect-1.0 webrtcbin` 是否存在；没有则安装 `gstreamer1.0-plugins-bad`。
 - `gst-inspect-1.0 x264enc` 是否存在；没有则安装 `gstreamer1.0-plugins-ugly`。
 - `gst-inspect-1.0 avdec_h264` 是否存在；没有则安装 `gstreamer1.0-libav`。
-- 是否把 offer、answer、ice JSON 复制到了对端终端，而不是复制了 `[INFO]` 日志。
+- `video.source` 指向的本地文件是否存在；如果不确定，先改用 `videotestsrc is-live=true pattern=ball`。
+- 默认 TCP 信令下，是否先启动了接收端，且端口 `127.0.0.1:9000` 未被占用。
+- 手动控制台信令下，是否把 offer、answer、ice JSON 复制到了对端终端，而不是复制了 `[INFO]` 日志。
 - 是否运行在有桌面显示环境的 Linux 终端；无桌面环境下 `autovideosink` 可能无法弹窗。
 
 如果只想确认发送端管线能启动，可以先看发送端日志里是否有：
@@ -189,7 +243,7 @@ app:
 如果只想确认接收端已等待信令，可以看接收端日志里是否有：
 
 ```text
-接收端已启动，等待远端 offer。
+接收端已启动，等待 TCP 信令连接。
 ```
 
 ## 弱网控制逻辑
@@ -226,15 +280,15 @@ app:
 
 第一阶段建议先在 Linux 上完成：
 
-1. 使用 `videotestsrc` 验证发送/接收链路。
+1. 使用本地视频文件或 `videotestsrc` 验证发送/接收链路。
 2. 替换为真实摄像头，例如 `v4l2src device=/dev/video0`。
 3. 根据硬件平台替换编码器，例如 `v4l2h264enc`、`vaapih264enc`、`nvh264enc`。
-4. 接入真实 WebSocket 信令服务器。
+4. 将本机 TCP 信令替换为真实 WebSocket/MQTT/自研信令服务器。
 5. 使用 `tc netem` 或 Clumsy 对照 `docs/test-cases.md` 做弱网测试。
 
 ## 当前版本边界
 
-当前代码是可扩展工程骨架，核心链路、配置、自适应状态机和 WebRTC 管线已经放好；控制台信令用于早期联调，不建议直接用于生产。生产版本建议替换 `src/signaling/ConsoleSignalingClient.*`，保留 `SignalingMessage` 数据结构即可。
+当前代码是可扩展工程骨架，核心链路、配置、自适应状态机和 WebRTC 管线已经放好；内置 TCP/控制台信令用于早期联调，不建议直接用于生产。生产版本建议替换 `src/signaling/ConsoleSignalingClient.*`，保留 `SignalingMessage` 数据结构即可。
 
 ## 注意事项
 
