@@ -117,12 +117,13 @@ std::string SenderSession::build_pipeline_description() const
     if (config_.video_encoder == "x264enc") {
         oss << " tune=zerolatency speed-preset=ultrafast bframes=0 byte-stream=true"
             << " key-int-max=" << config_.keyframe_interval
+            << " vbv-buf-capacity=100 sliced-threads=true intra-refresh=true"
             << " bitrate=" << config_.max_bitrate_kbps;
     }
 
     oss << " ! video/x-h264,profile=baseline"
         << " ! h264parse config-interval=1"
-        << " ! rtph264pay pt=96 config-interval=1"
+        << " ! rtph264pay pt=96 config-interval=-1 mtu=1000 aggregate-mode=zero-latency"
         << " ! application/x-rtp,media=video,encoding-name=H264,payload=96"
         << " ! webrtcbin name=webrtc bundle-policy=max-bundle";
 

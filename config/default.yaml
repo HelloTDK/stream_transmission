@@ -10,7 +10,7 @@ app:
   turn_password:                                 # TURN 密码预留；当前 webrtcbin 主要使用 turn_server 内嵌密码
 
 signaling:
-  url: tcp://<ip>:9000                      # 本机自动信令；recv 监听、send 连接。留空则回退为手动控制台 JSON 信令
+  url: tcp://192.168.31.114:9000                      # 本机自动信令；recv 监听、send 连接。留空则回退为手动控制台 JSON 信令
   room: weaknet-demo                             # 信令房间/会话 ID 预留，用于后续让发送端和接收端自动匹配
 
 video:
@@ -30,7 +30,7 @@ video:
   initial_width: 1280                             # 初始视频宽度，单位像素；启动建链时使用
   initial_height: 720                             # 初始视频高度，单位像素；启动建链时使用
   initial_fps: 30                                 # 初始视频帧率，单位 fps；启动建链时使用
-  keyframe_interval: 30                           # 初始关键帧间隔；x264enc 下对应 key-int-max
+  keyframe_interval: 15                           # 初始关键帧间隔；x264enc 下对应 key-int-max
 
 network:
   downshift_window_ms: 500                        # 网络变差后的降级等待窗口，单位毫秒；要求 2 秒内明显降码率
@@ -40,15 +40,15 @@ network:
   target_latency_max_ms: 500                      # 常规弱网目标最高端到端延迟，单位毫秒；极端丢包时可放宽
   bandwidth_safety_ratio: 0.70                    # 估算带宽可信时只使用其中一部分，避免把链路打满造成拥塞
 
-  medium_loss_threshold: 0.05                     # Medium 档丢包阈值；丢包率 >= 5% 触发轻度降级
-  bad_loss_threshold: 0.20                        # Bad 档丢包阈值；丢包率 >= 20% 触发 480p/低帧率策略
-  severe_loss_threshold: 0.45                     # Severe 档丢包阈值；丢包率 >= 45% 进入强降级策略
-  extreme_loss_threshold: 0.80                    # Extreme 档丢包阈值；丢包率 >= 80% 进入极端保图像策略
+  medium_loss_threshold: 0.03                     # Medium 档丢包阈值；丢包率 >= 3% 及早轻度降级
+  bad_loss_threshold: 0.10                        # Bad 档丢包阈值；丢包率 >= 10% 进入低分辨率/低帧率
+  severe_loss_threshold: 0.25                     # Severe 档丢包阈值；丢包率 >= 25% 强降级保连续画面
+  extreme_loss_threshold: 0.50                    # Extreme 档丢包阈值；丢包率 >= 50% 只保可识别画面
 
-  medium_rtt_ms: 180                              # Medium 档 RTT 阈值，单位毫秒
-  bad_rtt_ms: 300                                 # Bad 档 RTT 阈值，单位毫秒
-  severe_rtt_ms: 500                              # Severe 档 RTT 阈值，单位毫秒
-  extreme_rtt_ms: 1000                            # Extreme 档 RTT 阈值，单位毫秒
+  medium_rtt_ms: 120                              # Medium 档 RTT 阈值，单位毫秒
+  bad_rtt_ms: 220                                 # Bad 档 RTT 阈值，单位毫秒
+  severe_rtt_ms: 400                              # Severe 档 RTT 阈值，单位毫秒
+  extreme_rtt_ms: 800                             # Extreme 档 RTT 阈值，单位毫秒
 
   medium_jitter_ms: 30                            # Medium 档 jitter 阈值，单位毫秒
   bad_jitter_ms: 80                               # Bad 档 jitter 阈值，单位毫秒
@@ -59,37 +59,37 @@ profiles.good:
   width: 1280                                     # Good 档输出宽度；带宽充足时使用较高画质
   height: 720                                     # Good 档输出高度；当前默认最高 720p
   fps: 30                                        # Good 档帧率
-  bitrate_cap_kbps: 0                             # Good 档码率上限；0 表示使用 video.max_bitrate_kbps
-  keyframe_interval: 30                           # Good 档关键帧间隔
+  bitrate_cap_kbps: 1800                          # Good 档码率上限，保留余量避免打满链路
+  keyframe_interval: 15                           # Good 档关键帧间隔
   enable_guard_stream: false                      # Good 档不启用保底图像通道
 
 profiles.medium:
   width: 960                                      # Medium 档输出宽度；轻度丢包时轻微降分辨率
   height: 540                                     # Medium 档输出高度
-  fps: 25                                        # Medium 档帧率
-  bitrate_cap_kbps: 1200                          # Medium 档码率上限，单位 kbps
-  keyframe_interval: 25                           # Medium 档关键帧间隔
+  fps: 20                                        # Medium 档帧率
+  bitrate_cap_kbps: 1000                          # Medium 档码率上限，单位 kbps
+  keyframe_interval: 12                           # Medium 档关键帧间隔
   enable_guard_stream: false                      # Medium 档不启用保底图像通道
 
 profiles.bad:
-  width: 640                                      # Bad 档输出宽度；20% 以上丢包时降到 480p 级别
-  height: 480                                     # Bad 档输出高度
-  fps: 15                                        # Bad 档帧率；优先稳定和完整帧
-  bitrate_cap_kbps: 600                           # Bad 档码率上限，单位 kbps
-  keyframe_interval: 15                           # Bad 档关键帧间隔；缩短恢复时间
+  width: 640                                      # Bad 档输出宽度；10% 以上丢包时降到低清
+  height: 360                                     # Bad 档输出高度
+  fps: 12                                        # Bad 档帧率；优先稳定和完整帧
+  bitrate_cap_kbps: 500                           # Bad 档码率上限，单位 kbps
+  keyframe_interval: 8                            # Bad 档关键帧间隔；缩短恢复时间
   enable_guard_stream: false                      # Bad 档暂不启用保底图像通道
 
 profiles.severe:
   width: 480                                      # Severe 档输出宽度；45% 以上丢包时强降级
-  height: 360                                     # Severe 档输出高度
-  fps: 10                                        # Severe 档帧率
+  height: 270                                     # Severe 档输出高度
+  fps: 8                                         # Severe 档帧率
   bitrate_cap_kbps: 250                           # Severe 档码率上限，单位 kbps
-  keyframe_interval: 10                           # Severe 档关键帧间隔；更快恢复完整画面
+  keyframe_interval: 6                            # Severe 档关键帧间隔；更快恢复完整画面
   enable_guard_stream: false                      # Severe 档仍以主视频流为主
 
 profiles.extreme:
   width: 320                                      # Extreme 档输出宽度；80% 以上丢包时只保证可识别
-  height: 240                                     # Extreme 档输出高度
+  height: 180                                     # Extreme 档输出高度
   fps: 5                                         # Extreme 档帧率；允许低帧率换取完整图像
   bitrate_cap_kbps: 120                           # Extreme 档码率上限，单位 kbps
   keyframe_interval: 5                            # Extreme 档关键帧间隔；频繁关键帧提升恢复概率
