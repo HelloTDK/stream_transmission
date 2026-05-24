@@ -131,6 +131,27 @@ python3 scripts/python_receiver.py --host 127.0.0.1 --port 9000
 - `--record out.mp4`：把接收到的视频保存为文件；不传时默认丢弃媒体数据（用于纯链路/自适应联调）。
 - `--preview` / `--visualize`：开启 OpenCV 实时画面预览，按 `q` 或 `Esc` 关闭预览窗口；首次使用需要安装 `opencv-python`。
 - `--metrics-interval 1.0`：回传网络 metrics 的周期（秒），默认 1 秒。
+- `--disable-metrics`：不向 C++ 发送端回传 metrics，用于只验证媒体链路，避免自适应控制降码率。
+- `--debug-metrics`：打印 Python 接收端回传的 loss、RTT、jitter、估算带宽。
+- `--dtls-role passive|active|auto`：设置 answer SDP 里的 `a=setup` 角色。默认 `passive`，用于兼容 aiortc 与 GStreamer `webrtcbin`；如果发送端报 `GstDtlsDec ... Fatal SSL error`，优先确认这里不是 `auto`。
+
+如果 Python 接收端出现 ICE `completed` 后立即 `peer connection state: failed`，同时 C++ 发送端报：
+
+```text
+GstDtlsDec: Fatal SSL error
+```
+
+通常是 DTLS 角色/加密套件协商失败，而不是 TCP 信令或 ICE 地址不通。先按下面命令验证：
+
+```bash
+python3 scripts/python_receiver.py --host 0.0.0.0 --port 9000 --dtls-role passive --dump-sdp --debug-ice
+```
+
+正常情况下，接收端打印的 local answer SDP summary 里应包含：
+
+```text
+a=setup:passive
+```
 
 ## 本机 localhost 自收发测试
 

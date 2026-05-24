@@ -14,7 +14,7 @@ signaling:
   room: weaknet-demo                             # 信令房间/会话 ID 预留，用于后续让发送端和接收端自动匹配
 
 video:
-    source: uridecodebin uri=rtsp://admin:bnc123456@192.168.100.19/h264/ch1/main/av_stream
+    source: uridecodebin uri=<rtsp_url>
     encoder: x264enc
     max_bitrate_kbps: 1500
     min_bitrate_kbps: 150

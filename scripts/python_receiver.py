@@ -145,6 +145,7 @@ async def metrics_loop(
     pc: RTCPeerConnection,
     state: MetricsState,
     interval: float,
+    debug: bool,
 ) -> None:
     while True:
         await asyncio.sleep(interval)
@@ -196,15 +197,22 @@ async def metrics_loop(
         state.last_bytes_received = bytes_received
         state.last_ts = now
 
-        await signaling.send(
-            {
-                "type": "metrics",
-                "packetLossRatio": packet_loss_ratio,
-                "rttMs": rtt_ms,
-                "jitterMs": jitter_ms,
-                "estimatedKbps": estimated_kbps,
-            }
-        )
+        payload = {
+            "type": "metrics",
+            "packetLossRatio": packet_loss_ratio,
+            "rttMs": rtt_ms,
+            "jitterMs": jitter_ms,
+            "estimatedKbps": estimated_kbps,
+        }
+        if debug:
+            LOG.info(
+                "metrics: loss=%.3f rtt=%.1fms jitter=%.1fms estimated=%dkbps",
+                packet_loss_ratio,
+                rtt_ms,
+                jitter_ms,
+                estimated_kbps,
+            )
+        await signaling.send(payload)
 
 
 async def preview_loop(track: Any, window_name: str) -> None:
@@ -369,8 +377,10 @@ async def run(args: argparse.Namespace) -> None:
                     await sink.start()
                     started_sink = True
 
-                if metrics_task is None:
-                    metrics_task = asyncio.create_task(metrics_loop(signaling, pc, metrics_state, args.metrics_interval))
+                if metrics_task is None and not args.disable_metrics:
+                    metrics_task = asyncio.create_task(
+                        metrics_loop(signaling, pc, metrics_state, args.metrics_interval, args.debug_metrics)
+                    )
 
             elif msg_type == "ice":
                 candidate_line = message.get("candidate", "")
@@ -443,8 +453,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dtls-role",
         choices=("auto", "active", "passive"),
-        default="auto",
-        help="Override answer SDP a=setup role for DTLS troubleshooting (default: auto).",
+        default="passive",
+        help=(
+            "Answer SDP a=setup role. Use passive by default for better aiortc "
+            "interoperability with GStreamer webrtcbin DTLS; use auto to keep aiortc's default."
+        ),
     )
     parser.add_argument(
         "--stun-server",
@@ -459,6 +472,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Metrics reporting interval seconds (default: 1.0)",
+    )
+    parser.add_argument(
+        "--disable-metrics",
+        action="store_true",
+        help="Do not send receiver metrics to the C++ sender; useful to verify media without adaptive bitrate changes.",
+    )
+    parser.add_argument(
+        "--debug-metrics",
+        action="store_true",
+        help="Log receiver metrics before sending them to the C++ sender.",
     )
     return parser.parse_args()
 

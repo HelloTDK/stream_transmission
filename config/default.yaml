@@ -10,14 +10,15 @@ app:
   turn_password:                                 # TURN 密码预留；当前 webrtcbin 主要使用 turn_server 内嵌密码
 
 signaling:
-  url: tcp://127.0.0.1:9000                      # 本机自动信令；recv 监听、send 连接。留空则回退为手动控制台 JSON 信令
+  url: tcp://<ip>:9000                      # 本机自动信令；recv 监听、send 连接。留空则回退为手动控制台 JSON 信令
   room: weaknet-demo                             # 信令房间/会话 ID 预留，用于后续让发送端和接收端自动匹配
 
 video:
   # 后期接入真实摄像头时可改为：
   # v4l2src device=/dev/video0 is-live=true
   # source: videotestsrc is-live=true pattern=ball  # GStreamer 视频源；默认使用测试画面
-  source: uridecodebin uri=file:///home/cjj/streaming_transmission/1.mp4
+  # source: uridecodebin uri=file:///home/cjj/streaming_transmission/1.mp4
+  source: v4l2src device=/dev/video0 io-mode=2 is-live=true do-timestamp=true ! video/x-raw,format=YUY2,width=2560,height=720,framerate=30/1
   # 默认使用软件编码，方便 Linux 环境先跑通。
   # 后续可替换为 v4l2h264enc / vaapih264enc / nvh264enc 等硬件编码器。
   encoder: x264enc                                # H.264 编码器名称；默认使用 x264 软件编码
