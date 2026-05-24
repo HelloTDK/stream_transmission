@@ -132,12 +132,21 @@ def rewrite_sdp_setup_role(sdp: str, role: str) -> str:
     ) + "\r\n"
 
 
-def to_ms(value: Optional[float]) -> float:
+VIDEO_RTP_CLOCK_RATE = 90000.0
+
+
+def seconds_to_ms(value: Optional[float]) -> float:
     if value is None:
         return 0.0
     if value < 10.0:
         return value * 1000.0
     return value
+
+
+def rtp_timestamp_jitter_to_ms(value: Optional[float], clock_rate: float = VIDEO_RTP_CLOCK_RATE) -> float:
+    if value is None or value <= 0.0:
+        return 0.0
+    return (value / clock_rate) * 1000.0
 
 
 async def metrics_loop(
@@ -167,12 +176,12 @@ async def metrics_loop(
                 packets_received = max(packets_received, int(getattr(report, "packetsReceived", 0) or 0))
                 packets_lost = max(packets_lost, int(getattr(report, "packetsLost", 0) or 0))
                 bytes_received = max(bytes_received, int(getattr(report, "bytesReceived", 0) or 0))
-                jitter_ms = max(jitter_ms, to_ms(getattr(report, "jitter", 0.0)))
+                jitter_ms = max(jitter_ms, rtp_timestamp_jitter_to_ms(getattr(report, "jitter", 0.0)))
 
             if report_type in {"remote-inbound-rtp", "candidate-pair"}:
                 rtt_ms = max(
                     rtt_ms,
-                    to_ms(
+                    seconds_to_ms(
                         getattr(report, "roundTripTime", None)
                         or getattr(report, "currentRoundTripTime", None)
                     ),
