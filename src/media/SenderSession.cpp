@@ -6,6 +6,7 @@
 #include <gst/sdp/sdp.h>
 #include <gst/webrtc/webrtc.h>
 
+#include <iomanip>
 #include <sstream>
 
 namespace weaknet {
@@ -182,6 +183,14 @@ void SenderSession::handle_signaling_message(const SignalingMessage& message)
     }
 
     if (message.type == "metrics") {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(3)
+            << "收到接收端 metrics: loss=" << message.metrics.packet_loss_ratio
+            << " rtt=" << std::setprecision(1) << message.metrics.rtt_ms << "ms"
+            << " jitter=" << message.metrics.jitter_ms << "ms"
+            << " estimated=" << message.metrics.estimated_kbps << "kbps";
+        Logger::info(oss.str());
+
         const auto profile = adaptive_.update(message.metrics);
         apply_profile(profile);
     }
