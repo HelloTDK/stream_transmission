@@ -345,6 +345,30 @@ video:
 4. 将本机 TCP 信令替换为真实 WebSocket/MQTT/自研信令服务器。
 5. 使用 `tc netem` 或 Clumsy 对照 `docs/test-cases.md` 做弱网测试。
 
+Linux 发送端可以直接使用内置脚本按 10 秒阶梯切换弱网：
+
+```bash
+sudo ./scripts/netem-cycle.sh wlan0 10
+```
+
+档位顺序为：
+
+```text
+Good: 清除 netem
+Medium: loss 5%, delay 50ms 10ms
+Bad: loss 20%, delay 100ms 20ms
+Severe: loss 45%, delay 150ms 40ms
+Extreme: loss 80%, delay 200ms 50ms
+```
+
+第三个参数可以限制循环次数，例如只跑一轮：
+
+```bash
+sudo ./scripts/netem-cycle.sh wlan0 10 1
+```
+
+按 `Ctrl+C` 或脚本结束时会自动执行 `tc qdisc del dev <iface> root` 清理弱网规则。
+
 ## 当前版本边界
 
 当前代码是可扩展工程骨架，核心链路、配置、自适应状态机和 WebRTC 管线已经放好；内置 TCP/控制台信令用于早期联调，不建议直接用于生产。生产版本建议替换 `src/signaling/ConsoleSignalingClient.*`，保留 `SignalingMessage` 数据结构即可。
