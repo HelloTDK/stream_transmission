@@ -128,6 +128,8 @@ cmake --build build-win --config Release
 Windows 下建议先使用 `config/windows.yaml` 跑通测试源：
 
 ```powershell
+
+chcp 65001
 .\build-win\Release\weaknet_webrtc.exe --mode recv --config config\windows.yaml
 .\build-win\Release\weaknet_webrtc.exe --mode send --config config\windows.yaml
 ```
@@ -183,7 +185,7 @@ GstDtlsDec: Fatal SSL error
 通常是 DTLS 角色/加密套件协商失败，而不是 TCP 信令或 ICE 地址不通。先按下面命令验证：
 
 ```bash
-python scripts/python_receiver.py --host 0.0.0.0 --port 9000 --dtls-role passive --dump-sdp --debug-ice
+python scripts/python_receiver.py --host 0.0.0.0 --port 19000 --dtls-role passive --dump-sdp --debug-ice --preview
 ```
 
 正常情况下，接收端打印的 local answer SDP summary 里应包含：
@@ -411,7 +413,9 @@ sudo ./scripts/netem-cycle.sh wlan0 10 1
 # clumsy 设置
 udp and (ip.SrcAddr == 192.168.100.27 or ip.DstAddr == 192.168.100.27)
 
- inbound and udp and ip.SrcAddr == 192.168.100.27
+udp and (ip.SrcAddr == 192.168.31.26 or ip.DstAddr == 192.168.31.26)
+
+ inbound and udp and ip.SrcAddr == 192.168.31.26
 
 ## 当前版本边界
 

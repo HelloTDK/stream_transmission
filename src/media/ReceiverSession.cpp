@@ -34,6 +34,11 @@ bool structure_get_uint64_any(const GstStructure* structure, std::uint64_t& out,
         out = g_value_get_uint(value);
         return true;
     }
+    if (G_VALUE_HOLDS_INT64(value)) {
+        const auto signed_value = g_value_get_int64(value);
+        out = signed_value > 0 ? static_cast<std::uint64_t>(signed_value) : 0;
+        return true;
+    }
     if (G_VALUE_HOLDS_INT(value)) {
         const auto signed_value = g_value_get_int(value);
         out = signed_value > 0 ? static_cast<std::uint64_t>(signed_value) : 0;
@@ -77,17 +82,29 @@ bool structure_get_double_any(const GstStructure* structure, double& out, const 
     return false;
 }
 
-std::string structure_get_string_any(const GstStructure* structure, const char* name)
+bool is_relevant_webrtc_stats(const GstStructure* structure)
 {
-    const auto* value = gst_structure_get_value(structure, name);
+    const auto* value = gst_structure_get_value(structure, "type");
     if (!value) {
-        return {};
+        return false;
     }
+
+    if (G_VALUE_HOLDS_ENUM(value)) {
+        const auto type = static_cast<GstWebRTCStatsType>(g_value_get_enum(value));
+        return type == GST_WEBRTC_STATS_INBOUND_RTP ||
+            type == GST_WEBRTC_STATS_REMOTE_INBOUND_RTP ||
+            type == GST_WEBRTC_STATS_CANDIDATE_PAIR;
+    }
+
     if (G_VALUE_HOLDS_STRING(value)) {
         const auto* text = g_value_get_string(value);
-        return text ? text : "";
+        const std::string type = text ? text : "";
+        return type.find("inbound-rtp") != std::string::npos ||
+            type.find("remote-inbound-rtp") != std::string::npos ||
+            type.find("candidate-pair") != std::string::npos;
     }
-    return {};
+
+    return false;
 }
 
 } // namespace
@@ -360,10 +377,7 @@ void ReceiverSession::on_stats_ready(GstPromise* promise, gpointer user_data)
         }
 
         const auto* stats = gst_value_get_structure(value);
-        const auto type = structure_get_string_any(stats, "type");
-        if (type.find("inbound-rtp") == std::string::npos &&
-            type.find("remote-inbound-rtp") == std::string::npos &&
-            type.find("candidate-pair") == std::string::npos) {
+        if (!is_relevant_webrtc_stats(stats)) {
             continue;
         }
 
