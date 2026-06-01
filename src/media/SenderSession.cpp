@@ -4,12 +4,38 @@
 #include "util/Logger.h"
 
 #include <gst/sdp/sdp.h>
+#include <gst/video/video-event.h>
 #include <gst/webrtc/webrtc.h>
 
 #include <iomanip>
 #include <sstream>
 
 namespace weaknet {
+namespace {
+
+constexpr double kDamageFreeLossThreshold = 0.10;
+
+bool has_property(GstElement* element, const char* property_name)
+{
+    return element &&
+        g_object_class_find_property(G_OBJECT_GET_CLASS(element), property_name) != nullptr;
+}
+
+void set_boolean_property_if_present(GstElement* element, const char* property_name, gboolean value)
+{
+    if (has_property(element, property_name)) {
+        g_object_set(element, property_name, value, nullptr);
+    }
+}
+
+void set_uint_property_if_present(GstElement* element, const char* property_name, guint value)
+{
+    if (has_property(element, property_name)) {
+        g_object_set(element, property_name, value, nullptr);
+    }
+}
+
+} // namespace
 
 SenderSession::SenderSession(const Config& config,
                              std::shared_ptr<ConsoleSignalingClient> signaling,
@@ -193,6 +219,7 @@ void SenderSession::handle_signaling_message(const SignalingMessage& message)
         Logger::info(oss.str());
 
         const auto profile = adaptive_.update(message.metrics);
+        update_damage_free_mode(message.metrics.packet_loss_ratio);
         apply_profile(profile);
     }
 }
@@ -249,7 +276,7 @@ void SenderSession::apply_profile(const EncoderProfile& profile)
     gst_caps_unref(caps);
 
     if (config_.video_encoder == "x264enc") {
-        g_object_set(encoder_, "key-int-max", static_cast<int>(profile.keyframe_interval), nullptr);
+        apply_x264_damage_free_mode(profile);
     }
 
     Logger::info(
@@ -273,6 +300,81 @@ void SenderSession::apply_bitrate(std::uint32_t bitrate_kbps)
 
     // 不同硬编插件的码率属性名不同，因此通过配置项映射。
     g_object_set(encoder_, config_.encoder_bitrate_property.c_str(), value, nullptr);
+}
+
+void SenderSession::update_damage_free_mode(double packet_loss_ratio)
+{
+    const bool should_enable = packet_loss_ratio > kDamageFreeLossThreshold;
+    const bool should_disable = packet_loss_ratio < kDamageFreeLossThreshold;
+
+    if (should_enable && !damage_free_mode_) {
+        damage_free_mode_ = true;
+        Logger::warn("loss > 10%, sender switches to damage-free mode: every frame is encoded as an independent keyframe.");
+        request_keyframe();
+        return;
+    }
+
+    if (should_disable && damage_free_mode_) {
+        damage_free_mode_ = false;
+        Logger::info("loss < 10%, sender restores the normal adaptive encoding strategy.");
+        request_keyframe();
+    }
+}
+
+void SenderSession::apply_x264_damage_free_mode(const EncoderProfile& profile)
+{
+    if (!encoder_) {
+        return;
+    }
+
+    const guint key_interval = damage_free_mode_
+        ? 1u
+        : static_cast<guint>(profile.keyframe_interval);
+
+    set_uint_property_if_present(encoder_, "key-int-max", key_interval);
+    set_uint_property_if_present(encoder_, "bframes", 0);
+
+    if (damage_free_mode_) {
+        set_uint_property_if_present(encoder_, "ref", 1);
+        set_boolean_property_if_present(encoder_, "intra-refresh", FALSE);
+    } else {
+        set_uint_property_if_present(encoder_, "ref", 3);
+        set_boolean_property_if_present(encoder_, "intra-refresh", TRUE);
+    }
+}
+
+void SenderSession::request_keyframe()
+{
+    if (!encoder_) {
+        return;
+    }
+
+    bool sent = false;
+    ++force_key_unit_count_;
+
+    if (auto* sink_pad = gst_element_get_static_pad(encoder_, "sink")) {
+        auto* event = gst_video_event_new_downstream_force_key_unit(
+            GST_CLOCK_TIME_NONE,
+            GST_CLOCK_TIME_NONE,
+            GST_CLOCK_TIME_NONE,
+            TRUE,
+            force_key_unit_count_);
+        sent = gst_pad_send_event(sink_pad, event) || sent;
+        gst_object_unref(sink_pad);
+    }
+
+    if (auto* src_pad = gst_element_get_static_pad(encoder_, "src")) {
+        auto* event = gst_video_event_new_upstream_force_key_unit(
+            GST_CLOCK_TIME_NONE,
+            TRUE,
+            force_key_unit_count_);
+        sent = gst_pad_send_event(src_pad, event) || sent;
+        gst_object_unref(src_pad);
+    }
+
+    if (!sent) {
+        Logger::warn("force-keyframe event was not accepted; key-int-max still applies to following frames.");
+    }
 }
 
 void SenderSession::on_negotiation_needed(GstElement*, gpointer user_data)

@@ -31,6 +31,9 @@ private:
     void add_ice_candidate(unsigned int mline_index, const std::string& candidate);
     void apply_profile(const EncoderProfile& profile);
     void apply_bitrate(std::uint32_t bitrate_kbps);
+    void update_damage_free_mode(double packet_loss_ratio);
+    void apply_x264_damage_free_mode(const EncoderProfile& profile);
+    void request_keyframe();
     std::string build_pipeline_description() const;
 
     Config config_;
@@ -41,6 +44,8 @@ private:
     GstElement* encoder_ = nullptr;
     GstElement* capsfilter_ = nullptr;
     AdaptiveController adaptive_;
+    bool damage_free_mode_ = false;
+    guint force_key_unit_count_ = 0;
     guint metrics_timer_id_ = 0;
     guint bus_watch_id_ = 0;
 };

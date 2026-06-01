@@ -107,6 +107,19 @@ bool is_relevant_webrtc_stats(const GstStructure* structure)
     return false;
 }
 
+bool has_property(GstElement* element, const char* property_name)
+{
+    return element &&
+        g_object_class_find_property(G_OBJECT_GET_CLASS(element), property_name) != nullptr;
+}
+
+void set_boolean_property_if_present(GstElement* element, const char* property_name, gboolean value)
+{
+    if (has_property(element, property_name)) {
+        g_object_set(element, property_name, value, nullptr);
+    }
+}
+
 } // namespace
 
 ReceiverSession::ReceiverSession(const Config& config,
@@ -283,6 +296,9 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
         Logger::error("创建接收端解码链路失败，请确认 libav/good/bad 插件已安装。");
         return;
     }
+
+    set_boolean_property_if_present(depay, "request-keyframe", TRUE);
+    set_boolean_property_if_present(depay, "wait-for-keyframe", TRUE);
 
     if (auto* jitterbuffer = gst_element_factory_make("rtpjitterbuffer", nullptr)) {
         g_object_set(jitterbuffer,
