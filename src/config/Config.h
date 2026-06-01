@@ -23,9 +23,9 @@ struct Config {
     std::string encoder_bitrate_property = "bitrate";
     std::string encoder_bitrate_unit = "kbps";
 
-    std::uint32_t max_bitrate_kbps = 2000;
+    std::uint32_t max_bitrate_kbps = 8000;
     std::uint32_t min_bitrate_kbps = 80;
-    std::uint32_t initial_width = 1280;
+    std::uint32_t initial_width = 2560;
     std::uint32_t initial_height = 720;
     std::uint32_t initial_fps = 30;
     std::uint32_t keyframe_interval = 30;
@@ -52,11 +52,11 @@ struct Config {
     double severe_jitter_ms = 150.0;
     double extreme_jitter_ms = 300.0;
 
-    GradeProfileConfig good_profile{1280, 720, 30, 0, 30, false};
-    GradeProfileConfig medium_profile{960, 540, 25, 1200, 25, false};
-    GradeProfileConfig bad_profile{640, 480, 15, 600, 15, false};
-    GradeProfileConfig severe_profile{480, 360, 10, 250, 10, false};
-    GradeProfileConfig extreme_profile{320, 240, 5, 120, 5, true};
+    GradeProfileConfig good_profile{2560, 720, 30, 6000, 30, false};
+    GradeProfileConfig medium_profile{1920, 540, 20, 2500, 20, false};
+    GradeProfileConfig bad_profile{1280, 360, 12, 1000, 1, false};
+    GradeProfileConfig severe_profile{960, 270, 8, 500, 1, false};
+    GradeProfileConfig extreme_profile{640, 180, 5, 250, 1, true};
 
     std::string receiver_sink = "autovideosink";
     bool hold_last_frame = true;

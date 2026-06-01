@@ -14,9 +14,9 @@ video:
   encoder: x264enc
   encoder_bitrate_property: bitrate
   encoder_bitrate_unit: kbps
-  max_bitrate_kbps: 2000
+  max_bitrate_kbps: 8000
   min_bitrate_kbps: 80
-  initial_width: 1280
+  initial_width: 2560
   initial_height: 720
   initial_fps: 30
   keyframe_interval: 30

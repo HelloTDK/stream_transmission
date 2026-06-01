@@ -419,7 +419,7 @@ void ReceiverSession::on_stats_ready(GstPromise* promise, gpointer user_data)
             rtt_ms = std::max(rtt_ms, value_double < 10.0 ? value_double * 1000.0 : value_double);
         }
         if (structure_get_double_any(stats, value_double, "jitter")) {
-            jitter_ms = std::max(jitter_ms, value_double < 10.0 ? value_double * 1000.0 : value_double);
+            jitter_ms = std::max(jitter_ms, value_double * 1000.0);
         }
     }
 

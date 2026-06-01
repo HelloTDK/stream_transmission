@@ -33,6 +33,7 @@ int grade_rank(NetworkGrade grade)
 
 AdaptiveController::AdaptiveController(AdaptiveConfig config)
     : config_(config)
+    , last_switch_ms_(steady_now_ms())
 {
     current_profile_ = build_profile(NetworkGrade::Good, {});
 }
@@ -49,7 +50,6 @@ EncoderProfile AdaptiveController::update(const NetworkMetrics& metrics)
         return current_profile_;
     }
 
-    // 即使档位不切换，也允许在当前档位内根据估算带宽微调码率。
     current_profile_ = build_profile(current_grade_, metrics);
     return current_profile_;
 }
@@ -86,8 +86,10 @@ EncoderProfile AdaptiveController::build_profile(NetworkGrade grade, const Netwo
     EncoderProfile profile;
     profile.grade = grade;
 
-    // 带宽估算值不可信时，以配置最大码率为上限；可信时按配置比例保守使用。
-    const auto estimated_limit = metrics.estimated_kbps > 0
+    // Good means loss/RTT/jitter did not trigger weak-network handling. Do not use
+    // current receive throughput to lower the sender bitrate, or normal links can
+    // feed back into lower and lower quality.
+    const auto estimated_limit = grade != NetworkGrade::Good && metrics.estimated_kbps > 0
         ? static_cast<std::uint32_t>(metrics.estimated_kbps * config_.bandwidth_safety_ratio)
         : config_.max_bitrate_kbps;
     const auto upper = clamp_bitrate(estimated_limit, config_.min_bitrate_kbps, config_.max_bitrate_kbps);
@@ -124,12 +126,10 @@ bool AdaptiveController::should_switch(NetworkGrade target_grade, std::int64_t n
     const auto current_rank = grade_rank(current_grade_);
     const auto target_rank = grade_rank(target_grade);
 
-    // 网络变差时快速降级，避免继续占用链路导致拥塞扩大。
     if (target_rank > current_rank) {
         return elapsed >= static_cast<std::int64_t>(config_.downshift_window_ms);
     }
 
-    // 网络恢复时慢速升级，避免短暂恢复造成码率上下振荡。
     return elapsed >= static_cast<std::int64_t>(config_.upshift_window_ms);
 }
 

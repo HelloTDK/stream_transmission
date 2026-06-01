@@ -141,9 +141,9 @@ std::string SenderSession::build_pipeline_description() const
         << " ! " << config_.video_encoder << " name=video_encoder";
 
     if (config_.video_encoder == "x264enc") {
-        oss << " tune=zerolatency speed-preset=ultrafast bframes=0 byte-stream=true"
+        oss << " tune=zerolatency speed-preset=veryfast bframes=0 byte-stream=true"
             << " key-int-max=" << config_.keyframe_interval
-            << " vbv-buf-capacity=100 sliced-threads=true intra-refresh=true"
+            << " vbv-buf-capacity=100 sliced-threads=true intra-refresh=false ref=3"
             << " bitrate=" << config_.max_bitrate_kbps;
     }
 
@@ -339,7 +339,7 @@ void SenderSession::apply_x264_damage_free_mode(const EncoderProfile& profile)
         set_boolean_property_if_present(encoder_, "intra-refresh", FALSE);
     } else {
         set_uint_property_if_present(encoder_, "ref", 3);
-        set_boolean_property_if_present(encoder_, "intra-refresh", TRUE);
+        set_boolean_property_if_present(encoder_, "intra-refresh", FALSE);
     }
 }
 
