@@ -120,6 +120,13 @@ void set_boolean_property_if_present(GstElement* element, const char* property_n
     }
 }
 
+void set_int_property_if_present(GstElement* element, const char* property_name, gint value)
+{
+    if (has_property(element, property_name)) {
+        g_object_set(element, property_name, value, nullptr);
+    }
+}
+
 } // namespace
 
 ReceiverSession::ReceiverSession(const Config& config,
@@ -299,12 +306,18 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
 
     set_boolean_property_if_present(depay, "request-keyframe", TRUE);
     set_boolean_property_if_present(depay, "wait-for-keyframe", TRUE);
+    set_int_property_if_present(parse, "config-interval", -1);
+    set_boolean_property_if_present(parse, "disable-passthrough", TRUE);
+    set_boolean_property_if_present(decoder, "output-corrupt", FALSE);
+    set_boolean_property_if_present(decoder, "discard-corrupted-frames", TRUE);
 
     if (auto* jitterbuffer = gst_element_factory_make("rtpjitterbuffer", nullptr)) {
         g_object_set(jitterbuffer,
                      "latency", static_cast<guint>(config_.jitter_buffer_latency_ms),
                      "drop-on-latency", config_.drop_late_frames ? TRUE : FALSE,
                      nullptr);
+        set_boolean_property_if_present(jitterbuffer, "do-lost", TRUE);
+        set_boolean_property_if_present(jitterbuffer, "post-drop-messages", TRUE);
         gst_bin_add(GST_BIN(pipeline_), jitterbuffer);
         gst_element_sync_state_with_parent(jitterbuffer);
 

@@ -13,7 +13,8 @@
 namespace weaknet {
 namespace {
 
-constexpr double kDamageFreeLossThreshold = 0.10;
+constexpr double kDamageFreeEnableLossThreshold = 0.10;
+constexpr double kDamageFreeDisableLossThreshold = 0.05;
 
 bool has_property(GstElement* element, const char* property_name)
 {
@@ -304,19 +305,19 @@ void SenderSession::apply_bitrate(std::uint32_t bitrate_kbps)
 
 void SenderSession::update_damage_free_mode(double packet_loss_ratio)
 {
-    const bool should_enable = packet_loss_ratio > kDamageFreeLossThreshold;
-    const bool should_disable = packet_loss_ratio < kDamageFreeLossThreshold;
+    const bool should_enable = packet_loss_ratio >= kDamageFreeEnableLossThreshold;
+    const bool should_disable = packet_loss_ratio < kDamageFreeDisableLossThreshold;
 
     if (should_enable && !damage_free_mode_) {
         damage_free_mode_ = true;
-        Logger::warn("loss > 10%, sender switches to damage-free mode: every frame is encoded as an independent keyframe.");
+        Logger::warn("loss >= 10%, sender switches to damage-free mode: every frame is encoded as an independent keyframe.");
         request_keyframe();
         return;
     }
 
     if (should_disable && damage_free_mode_) {
         damage_free_mode_ = false;
-        Logger::info("loss < 10%, sender restores the normal adaptive encoding strategy.");
+        Logger::info("loss < 5%, sender restores the normal adaptive encoding strategy.");
         request_keyframe();
     }
 }

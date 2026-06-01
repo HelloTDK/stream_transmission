@@ -86,10 +86,10 @@ EncoderProfile AdaptiveController::build_profile(NetworkGrade grade, const Netwo
     EncoderProfile profile;
     profile.grade = grade;
 
-    // Good means loss/RTT/jitter did not trigger weak-network handling. Do not use
-    // current receive throughput to lower the sender bitrate, or normal links can
-    // feed back into lower and lower quality.
-    const auto estimated_limit = grade != NetworkGrade::Good && metrics.estimated_kbps > 0
+    // Use receive-throughput feedback only for mild degradation. In Bad or worse
+    // modes the stream intentionally changes shape, so the measured throughput is
+    // a result of our own low output and must not push bitrate down to min.
+    const auto estimated_limit = grade == NetworkGrade::Medium && metrics.estimated_kbps > 0
         ? static_cast<std::uint32_t>(metrics.estimated_kbps * config_.bandwidth_safety_ratio)
         : config_.max_bitrate_kbps;
     const auto upper = clamp_bitrate(estimated_limit, config_.min_bitrate_kbps, config_.max_bitrate_kbps);
