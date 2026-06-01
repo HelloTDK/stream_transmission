@@ -39,7 +39,18 @@ target_include_directories(weaknet_webrtc PRIVATE
 
 target_link_directories(weaknet_webrtc PRIVATE ${GST_LIBRARY_DIRS})
 target_link_libraries(weaknet_webrtc PRIVATE ${GST_LIBRARIES})
-target_compile_options(weaknet_webrtc PRIVATE ${GST_CFLAGS_OTHER} -Wall -Wextra -Wpedantic)
+
+if(WIN32)
+    target_compile_definitions(weaknet_webrtc PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(weaknet_webrtc PRIVATE Ws2_32)
+endif()
+
+if(MSVC)
+    target_compile_definitions(weaknet_webrtc PRIVATE GST_USE_UNSTABLE_API)
+    target_compile_options(weaknet_webrtc PRIVATE /W4 /permissive- /utf-8)
+else()
+    target_compile_options(weaknet_webrtc PRIVATE ${GST_CFLAGS_OTHER} -Wall -Wextra -Wpedantic)
+endif()
 
 install(TARGETS weaknet_webrtc RUNTIME DESTINATION bin)
-install(FILES config/default.yaml DESTINATION etc/weaknet_webrtc)
+install(FILES config/default.yaml config/windows.yaml DESTINATION etc/weaknet_webrtc)

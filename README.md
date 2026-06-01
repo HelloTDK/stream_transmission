@@ -2,7 +2,7 @@
 
 本项目是面向 **远距离、高干扰、高丢包图像传输** 场景的 C++17 / GStreamer / WebRTC 工程骨架。设计目标是：在网络质量很差时优先保证图像不中断、可识别；在网络质量较好时尽可能利用带宽提升画质。
 
-> 当前仓库按 Linux 部署环境设计。
+> 当前仓库支持 Linux 和 Windows；`config/default.yaml` 偏 Linux 设备源，Windows 可先使用 `config/windows.yaml` 跑通测试源。
 
 ## 技术路线
 
@@ -65,11 +65,43 @@ sudo apt install -y \
 - NVIDIA：对应版本的 GStreamer NVENC 插件
 - V4L2 硬编：确认系统内有 `v4l2h264enc`
 
+## Windows 依赖
+
+推荐使用 64 位 MSVC 工具链：
+
+1. 安装 Visual Studio 2022 C++ 桌面开发工具。
+2. 安装 GStreamer 1.0 MSVC x86_64 的 Runtime 和 Development 包。
+3. 确认 GStreamer 的 `bin` 和 `lib/pkgconfig` 可以被 CMake 找到。
+
+PowerShell 示例：
+
+```powershell
+$env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = "C:\gstreamer\1.0\msvc_x86_64"
+$env:Path = "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\bin;$env:Path"
+$env:PKG_CONFIG_PATH = "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\lib\pkgconfig"
+```
+
+需要确认以下插件存在：
+
+```powershell
+gst-inspect-1.0 webrtcbin
+gst-inspect-1.0 x264enc
+gst-inspect-1.0 avdec_h264
+gst-inspect-1.0 autovideosink
+```
+
 ## 编译
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+```
+
+Windows / MSVC：
+
+```powershell
+cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64
+cmake --build build-win --config Release
 ```
 
 ## 运行方式
@@ -91,6 +123,13 @@ cmake --build build -j
 
 ```bash
 ./build/weaknet_webrtc --mode send --config config/default.yaml
+```
+
+Windows 下建议先使用 `config/windows.yaml` 跑通测试源：
+
+```powershell
+.\build-win\Release\weaknet_webrtc.exe --mode recv --config config\windows.yaml
+.\build-win\Release\weaknet_webrtc.exe --mode send --config config\windows.yaml
 ```
 
 命令行参数：
@@ -144,7 +183,7 @@ GstDtlsDec: Fatal SSL error
 通常是 DTLS 角色/加密套件协商失败，而不是 TCP 信令或 ICE 地址不通。先按下面命令验证：
 
 ```bash
-python3 scripts/python_receiver.py --host 0.0.0.0 --port 9000 --dtls-role passive --dump-sdp --debug-ice
+python scripts/python_receiver.py --host 0.0.0.0 --port 9000 --dtls-role passive --dump-sdp --debug-ice
 ```
 
 正常情况下，接收端打印的 local answer SDP summary 里应包含：
@@ -368,6 +407,11 @@ sudo ./scripts/netem-cycle.sh wlan0 10 1
 ```
 
 按 `Ctrl+C` 或脚本结束时会自动执行 `tc qdisc del dev <iface> root` 清理弱网规则。
+
+# clumsy 设置
+udp and (ip.SrcAddr == 192.168.100.27 or ip.DstAddr == 192.168.100.27)
+
+ inbound and udp and ip.SrcAddr == 192.168.100.27
 
 ## 当前版本边界
 

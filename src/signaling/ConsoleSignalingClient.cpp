@@ -3,34 +3,114 @@
 #include "util/Json.h"
 #include "util/Logger.h"
 
-#include <arpa/inet.h>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <iostream>
+#include <limits>
 #include <mutex>
+#include <thread>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <thread>
 #include <unistd.h>
+#endif
 
 namespace weaknet {
 namespace {
 std::mutex stdout_mutex;
 constexpr std::size_t max_pending_lines = 256;
 
-void close_fd(int& fd)
-{
-    if (fd >= 0) {
-        ::shutdown(fd, SHUT_RDWR);
-        ::close(fd);
-        fd = -1;
+class SocketRuntime {
+public:
+    SocketRuntime()
+    {
+#if defined(_WIN32)
+        WSADATA data{};
+        ok_ = WSAStartup(MAKEWORD(2, 2), &data) == 0;
+#endif
     }
+
+    ~SocketRuntime()
+    {
+#if defined(_WIN32)
+        if (ok_) {
+            WSACleanup();
+        }
+#endif
+    }
+
+    bool ok() const
+    {
+        return ok_;
+    }
+
+private:
+#if defined(_WIN32)
+    bool ok_ = false;
+#else
+    bool ok_ = true;
+#endif
+};
+
+void close_fd(ConsoleSignalingClient::SocketHandle& fd)
+{
+    if (fd == ConsoleSignalingClient::invalid_socket) {
+        return;
+    }
+
+#if defined(_WIN32)
+    ::shutdown(static_cast<SOCKET>(fd), SD_BOTH);
+    ::closesocket(static_cast<SOCKET>(fd));
+#else
+    ::shutdown(fd, SHUT_RDWR);
+    ::close(fd);
+#endif
+    fd = ConsoleSignalingClient::invalid_socket;
 }
 
 std::string socket_error()
 {
+#if defined(_WIN32)
+    return "WinSock error " + std::to_string(WSAGetLastError());
+#else
     return std::strerror(errno);
+#endif
+}
+
+bool is_valid_socket(ConsoleSignalingClient::SocketHandle fd)
+{
+    return fd != ConsoleSignalingClient::invalid_socket;
+}
+
+ConsoleSignalingClient::SocketHandle create_tcp_socket()
+{
+#if defined(_WIN32)
+    return static_cast<ConsoleSignalingClient::SocketHandle>(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+#else
+    return ::socket(AF_INET, SOCK_STREAM, 0);
+#endif
+}
+
+int socket_send_flags()
+{
+#if defined(MSG_NOSIGNAL)
+    return MSG_NOSIGNAL;
+#else
+    return 0;
+#endif
 }
 }
 
@@ -117,6 +197,12 @@ void ConsoleSignalingClient::read_loop()
 
 void ConsoleSignalingClient::tcp_loop()
 {
+    SocketRuntime socket_runtime;
+    if (!socket_runtime.ok()) {
+        Logger::error("初始化 TCP 信令运行时失败: " + socket_error());
+        return;
+    }
+
     std::string host;
     unsigned short port = 0;
     if (!parse_tcp_url(host, port)) {
@@ -133,14 +219,19 @@ void ConsoleSignalingClient::tcp_loop()
 
 void ConsoleSignalingClient::run_tcp_server(const std::string& host, unsigned short port)
 {
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) {
+    listen_fd_ = create_tcp_socket();
+    if (!is_valid_socket(listen_fd_)) {
         Logger::error("创建 TCP 信令监听 socket 失败: " + socket_error());
         return;
     }
 
     int reuse = 1;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    setsockopt(
+        listen_fd_,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        reinterpret_cast<const char*>(&reuse),
+        sizeof(reuse));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -164,8 +255,8 @@ void ConsoleSignalingClient::run_tcp_server(const std::string& host, unsigned sh
     }
 
     Logger::info("TCP 信令监听中: " + host + ":" + std::to_string(port));
-    const int fd = ::accept(listen_fd_, nullptr, nullptr);
-    if (fd < 0) {
+    const auto fd = static_cast<SocketHandle>(::accept(listen_fd_, nullptr, nullptr));
+    if (!is_valid_socket(fd)) {
         if (running_) {
             Logger::error("接受 TCP 信令连接失败: " + socket_error());
         }
@@ -185,8 +276,8 @@ void ConsoleSignalingClient::run_tcp_server(const std::string& host, unsigned sh
 void ConsoleSignalingClient::run_tcp_client(const std::string& host, unsigned short port)
 {
     while (running_) {
-        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) {
+        const auto fd = create_tcp_socket();
+        if (!is_valid_socket(fd)) {
             Logger::error("创建 TCP 信令连接 socket 失败: " + socket_error());
             return;
         }
@@ -196,7 +287,7 @@ void ConsoleSignalingClient::run_tcp_client(const std::string& host, unsigned sh
         addr.sin_port = htons(port);
         if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
             Logger::error("TCP 信令服务地址不是有效 IPv4: " + host);
-            int mutable_fd = fd;
+            auto mutable_fd = fd;
             close_fd(mutable_fd);
             return;
         }
@@ -212,7 +303,7 @@ void ConsoleSignalingClient::run_tcp_client(const std::string& host, unsigned sh
             return;
         }
 
-        int mutable_fd = fd;
+        auto mutable_fd = fd;
         close_fd(mutable_fd);
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
     }
@@ -232,7 +323,12 @@ bool ConsoleSignalingClient::parse_tcp_url(std::string& host, unsigned short& po
     }
 
     host = endpoint.substr(0, colon);
-    const auto parsed_port = std::stoul(endpoint.substr(colon + 1));
+    unsigned long parsed_port = 0;
+    try {
+        parsed_port = std::stoul(endpoint.substr(colon + 1));
+    } catch (const std::exception&) {
+        return false;
+    }
     if (parsed_port == 0 || parsed_port > 65535) {
         return false;
     }
@@ -241,7 +337,7 @@ bool ConsoleSignalingClient::parse_tcp_url(std::string& host, unsigned short& po
     return true;
 }
 
-void ConsoleSignalingClient::read_socket_loop(int fd)
+void ConsoleSignalingClient::read_socket_loop(SocketHandle fd)
 {
     std::string pending;
     char buffer[4096];
@@ -285,7 +381,7 @@ void ConsoleSignalingClient::read_socket_loop(int fd)
 bool ConsoleSignalingClient::send_socket_line(const std::string& line)
 {
     std::lock_guard<std::mutex> lock(socket_mutex_);
-    if (socket_fd_ < 0) {
+    if (!is_valid_socket(socket_fd_)) {
         if (pending_lines_.size() >= max_pending_lines) {
             pending_lines_.pop_front();
         }
@@ -311,7 +407,10 @@ bool ConsoleSignalingClient::send_socket_line_locked(const std::string& line)
     std::size_t remaining = payload.size();
 
     while (remaining > 0) {
-        const auto sent = ::send(socket_fd_, data, remaining, MSG_NOSIGNAL);
+        const auto chunk = remaining > static_cast<std::size_t>(std::numeric_limits<int>::max())
+            ? std::numeric_limits<int>::max()
+            : static_cast<int>(remaining);
+        const auto sent = ::send(socket_fd_, data, chunk, socket_send_flags());
         if (sent <= 0) {
             return false;
         }
@@ -324,7 +423,7 @@ bool ConsoleSignalingClient::send_socket_line_locked(const std::string& line)
 
 void ConsoleSignalingClient::flush_pending_locked()
 {
-    while (!pending_lines_.empty() && socket_fd_ >= 0) {
+    while (!pending_lines_.empty() && is_valid_socket(socket_fd_)) {
         const auto line = pending_lines_.front();
         if (!send_socket_line_locked(line)) {
             break;

@@ -3,6 +3,7 @@
 #include "adaptive/AdaptiveController.h"
 
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -24,6 +25,14 @@ class ConsoleSignalingClient {
 public:
     using MessageHandler = std::function<void(const SignalingMessage&)>;
 
+#if defined(_WIN32)
+    using SocketHandle = std::uintptr_t;
+    static constexpr SocketHandle invalid_socket = ~SocketHandle{0};
+#else
+    using SocketHandle = int;
+    static constexpr SocketHandle invalid_socket = -1;
+#endif
+
     ConsoleSignalingClient() = default;
     ConsoleSignalingClient(std::string role, std::string url);
     ~ConsoleSignalingClient();
@@ -44,7 +53,7 @@ private:
     void run_tcp_server(const std::string& host, unsigned short port);
     void run_tcp_client(const std::string& host, unsigned short port);
     bool parse_tcp_url(std::string& host, unsigned short& port) const;
-    void read_socket_loop(int fd);
+    void read_socket_loop(SocketHandle fd);
     bool send_socket_line(const std::string& line);
     bool send_socket_line_locked(const std::string& line);
     void flush_pending_locked();
@@ -58,8 +67,8 @@ private:
     std::string url_;
     std::mutex socket_mutex_;
     std::deque<std::string> pending_lines_;
-    int socket_fd_ = -1;
-    int listen_fd_ = -1;
+    SocketHandle socket_fd_ = invalid_socket;
+    SocketHandle listen_fd_ = invalid_socket;
 };
 
 } // namespace weaknet

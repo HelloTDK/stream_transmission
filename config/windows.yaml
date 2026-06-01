@@ -1,0 +1,28 @@
+app:
+  mode: send
+  stun_server: stun://stun.l.google.com:19302
+  turn_server:
+  turn_username:
+  turn_password:
+
+signaling:
+  url: tcp://0.0.0.0:19000
+  room: weaknet-demo
+
+video:
+  source: videotestsrc is-live=true pattern=ball
+  encoder: x264enc
+  encoder_bitrate_property: bitrate
+  encoder_bitrate_unit: kbps
+  max_bitrate_kbps: 2000
+  min_bitrate_kbps: 80
+  initial_width: 1280
+  initial_height: 720
+  initial_fps: 30
+  keyframe_interval: 30
+
+receiver:
+  sink: autovideosink
+  hold_last_frame: true
+  jitter_buffer_latency_ms: 120
+  drop_late_frames: true
