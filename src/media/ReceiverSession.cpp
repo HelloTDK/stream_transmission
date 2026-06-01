@@ -13,6 +13,9 @@
 namespace weaknet {
 namespace {
 
+constexpr double kKeyframeOnlyEnableLossThreshold = 0.10;
+constexpr double kKeyframeOnlyDisableLossThreshold = 0.05;
+
 std::int64_t steady_now_ms()
 {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -285,6 +288,32 @@ void ReceiverSession::on_incoming_stream(GstElement*, GstPad* pad, gpointer user
     static_cast<ReceiverSession*>(user_data)->link_decode_chain(pad);
 }
 
+GstPadProbeReturn ReceiverSession::on_decoded_input_probe(GstPad*, GstPadProbeInfo* info, gpointer user_data)
+{
+    auto* self = static_cast<ReceiverSession*>(user_data);
+    if ((GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) == 0) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    const auto flags = GST_BUFFER_FLAGS(buffer);
+    if ((flags & GST_BUFFER_FLAG_CORRUPTED) != 0 ||
+        (flags & GST_BUFFER_FLAG_DECODE_ONLY) != 0) {
+        return GST_PAD_PROBE_DROP;
+    }
+
+    if (self && self->keyframe_only_mode_ &&
+        (flags & GST_BUFFER_FLAG_DELTA_UNIT) != 0) {
+        return GST_PAD_PROBE_DROP;
+    }
+
+    return GST_PAD_PROBE_OK;
+}
+
 void ReceiverSession::link_decode_chain(GstPad* pad)
 {
     if (GST_PAD_DIRECTION(pad) != GST_PAD_SRC) {
@@ -310,6 +339,11 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
     set_boolean_property_if_present(parse, "disable-passthrough", TRUE);
     set_boolean_property_if_present(decoder, "output-corrupt", FALSE);
     set_boolean_property_if_present(decoder, "discard-corrupted-frames", TRUE);
+
+    if (auto* parse_src_pad = gst_element_get_static_pad(parse, "src")) {
+        gst_pad_add_probe(parse_src_pad, GST_PAD_PROBE_TYPE_BUFFER, &ReceiverSession::on_decoded_input_probe, this, nullptr);
+        gst_object_unref(parse_src_pad);
+    }
 
     if (auto* jitterbuffer = gst_element_factory_make("rtpjitterbuffer", nullptr)) {
         g_object_set(jitterbuffer,
@@ -446,6 +480,14 @@ void ReceiverSession::on_stats_ready(GstPromise* promise, gpointer user_data)
     metrics.packet_loss_ratio = delta_total > 0 ? static_cast<double>(delta_lost) / static_cast<double>(delta_total) : 0.0;
     metrics.rtt_ms = rtt_ms;
     metrics.jitter_ms = jitter_ms;
+
+    if (metrics.packet_loss_ratio >= kKeyframeOnlyEnableLossThreshold && !self->keyframe_only_mode_) {
+        self->keyframe_only_mode_ = true;
+        Logger::warn("receiver enters keyframe-only mode: dropping delta frames to avoid corrupted output.");
+    } else if (metrics.packet_loss_ratio < kKeyframeOnlyDisableLossThreshold && self->keyframe_only_mode_) {
+        self->keyframe_only_mode_ = false;
+        Logger::info("receiver leaves keyframe-only mode.");
+    }
 
     if (self->last_metrics_ms_ > 0 && now_ms > self->last_metrics_ms_ && bytes_received >= self->last_bytes_received_) {
         const auto delta_bytes = bytes_received - self->last_bytes_received_;
