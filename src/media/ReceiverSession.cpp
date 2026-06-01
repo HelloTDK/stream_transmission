@@ -192,6 +192,7 @@ void ReceiverSession::stop()
         gst_object_unref(pipeline_);
         pipeline_ = nullptr;
         webrtc_ = nullptr;
+        display_valve_ = nullptr;
     }
 }
 
@@ -314,6 +315,30 @@ GstPadProbeReturn ReceiverSession::on_decoded_input_probe(GstPad*, GstPadProbeIn
     return GST_PAD_PROBE_OK;
 }
 
+GstPadProbeReturn ReceiverSession::on_rtp_event_probe(GstPad*, GstPadProbeInfo* info, gpointer user_data)
+{
+    if ((GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) == 0) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    auto* event = GST_PAD_PROBE_INFO_EVENT(info);
+    if (!event || GST_EVENT_TYPE(event) != GST_EVENT_CUSTOM_DOWNSTREAM) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    const auto* structure = gst_event_get_structure(event);
+    if (!structure) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    const auto* name = gst_structure_get_name(structure);
+    if (name && std::string(name) == "GstRTPPacketLost") {
+        static_cast<ReceiverSession*>(user_data)->set_display_freeze(true);
+    }
+
+    return GST_PAD_PROBE_OK;
+}
+
 void ReceiverSession::link_decode_chain(GstPad* pad)
 {
     if (GST_PAD_DIRECTION(pad) != GST_PAD_SRC) {
@@ -325,13 +350,15 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
     auto* depay = gst_element_factory_make("rtph264depay", nullptr);
     auto* parse = gst_element_factory_make("h264parse", nullptr);
     auto* decoder = gst_element_factory_make("avdec_h264", nullptr);
+    auto* valve = gst_element_factory_make("valve", nullptr);
     auto* convert = gst_element_factory_make("videoconvert", nullptr);
     auto* sink = gst_element_factory_make(config_.receiver_sink.c_str(), nullptr);
 
-    if (!queue || !depay || !parse || !decoder || !convert || !sink) {
+    if (!queue || !depay || !parse || !decoder || !valve || !convert || !sink) {
         Logger::error("创建接收端解码链路失败，请确认 libav/good/bad 插件已安装。");
         return;
     }
+    display_valve_ = valve;
 
     set_boolean_property_if_present(depay, "request-keyframe", TRUE);
     set_boolean_property_if_present(depay, "wait-for-keyframe", TRUE);
@@ -355,28 +382,35 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
         gst_bin_add(GST_BIN(pipeline_), jitterbuffer);
         gst_element_sync_state_with_parent(jitterbuffer);
 
-        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, convert, sink, nullptr);
+        if (auto* jitter_src_pad = gst_element_get_static_pad(jitterbuffer, "src")) {
+            gst_pad_add_probe(jitter_src_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, &ReceiverSession::on_rtp_event_probe, this, nullptr);
+            gst_object_unref(jitter_src_pad);
+        }
+
+        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, valve, convert, sink, nullptr);
         gst_element_sync_state_with_parent(queue);
         gst_element_sync_state_with_parent(depay);
         gst_element_sync_state_with_parent(parse);
         gst_element_sync_state_with_parent(decoder);
+        gst_element_sync_state_with_parent(valve);
         gst_element_sync_state_with_parent(convert);
         gst_element_sync_state_with_parent(sink);
 
-        if (!gst_element_link_many(queue, jitterbuffer, depay, parse, decoder, convert, sink, nullptr)) {
+        if (!gst_element_link_many(queue, jitterbuffer, depay, parse, decoder, valve, convert, sink, nullptr)) {
             Logger::error("接收端解码链路连接失败。");
             return;
         }
     } else {
-        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, convert, sink, nullptr);
+        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, valve, convert, sink, nullptr);
         gst_element_sync_state_with_parent(queue);
         gst_element_sync_state_with_parent(depay);
         gst_element_sync_state_with_parent(parse);
         gst_element_sync_state_with_parent(decoder);
+        gst_element_sync_state_with_parent(valve);
         gst_element_sync_state_with_parent(convert);
         gst_element_sync_state_with_parent(sink);
 
-        if (!gst_element_link_many(queue, depay, parse, decoder, convert, sink, nullptr)) {
+        if (!gst_element_link_many(queue, depay, parse, decoder, valve, convert, sink, nullptr)) {
             Logger::error("接收端解码链路连接失败。");
             return;
         }
@@ -391,6 +425,24 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
         Logger::info("接收端解码链路已连接。");
     }
     gst_object_unref(sink_pad);
+}
+
+void ReceiverSession::set_display_freeze(bool freeze)
+{
+    if (display_frozen_ == freeze) {
+        return;
+    }
+
+    display_frozen_ = freeze;
+    if (display_valve_) {
+        g_object_set(display_valve_, "drop", freeze ? TRUE : FALSE, nullptr);
+    }
+
+    if (freeze) {
+        Logger::warn("receiver freezes display after RTP packet loss to avoid corrupted frames.");
+    } else {
+        Logger::info("receiver resumes display output.");
+    }
 }
 
 void ReceiverSession::on_ice_candidate(GstElement*, guint mlineindex, gchar* candidate, gpointer user_data)
@@ -483,9 +535,11 @@ void ReceiverSession::on_stats_ready(GstPromise* promise, gpointer user_data)
 
     if (metrics.packet_loss_ratio >= kKeyframeOnlyEnableLossThreshold && !self->keyframe_only_mode_) {
         self->keyframe_only_mode_ = true;
+        self->set_display_freeze(true);
         Logger::warn("receiver enters keyframe-only mode: dropping delta frames to avoid corrupted output.");
     } else if (metrics.packet_loss_ratio < kKeyframeOnlyDisableLossThreshold && self->keyframe_only_mode_) {
         self->keyframe_only_mode_ = false;
+        self->set_display_freeze(false);
         Logger::info("receiver leaves keyframe-only mode.");
     }
 

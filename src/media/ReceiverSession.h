@@ -24,6 +24,7 @@ private:
     static gboolean on_metrics_timer(gpointer user_data);
     static void on_stats_ready(GstPromise* promise, gpointer user_data);
     static GstPadProbeReturn on_decoded_input_probe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
+    static GstPadProbeReturn on_rtp_event_probe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
 
     void handle_signaling_message(const SignalingMessage& message);
     void handle_sdp_offer(const std::string& sdp);
@@ -31,18 +32,21 @@ private:
     void send_answer(GstPromise* promise);
     void add_ice_candidate(unsigned int mline_index, const std::string& candidate);
     void link_decode_chain(GstPad* pad);
+    void set_display_freeze(bool freeze);
 
     Config config_;
     std::shared_ptr<ConsoleSignalingClient> signaling_;
     GMainLoop* loop_ = nullptr;
     GstElement* pipeline_ = nullptr;
     GstElement* webrtc_ = nullptr;
+    GstElement* display_valve_ = nullptr;
     guint metrics_timer_id_ = 0;
     std::uint64_t last_packets_received_ = 0;
     std::uint64_t last_packets_lost_ = 0;
     std::uint64_t last_bytes_received_ = 0;
     std::int64_t last_metrics_ms_ = 0;
     bool keyframe_only_mode_ = false;
+    bool display_frozen_ = false;
 };
 
 } // namespace weaknet
