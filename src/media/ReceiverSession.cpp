@@ -3,18 +3,20 @@
 #include "util/Json.h"
 #include "util/Logger.h"
 
+#include <gst/app/gstappsrc.h>
 #include <gst/sdp/sdp.h>
 #include <gst/webrtc/webrtc.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 
 namespace weaknet {
 namespace {
 
-constexpr double kKeyframeOnlyEnableLossThreshold = 0.10;
-constexpr double kKeyframeOnlyDisableLossThreshold = 0.05;
+constexpr double kDamageFreeModeEnableLossThreshold = 0.10;
+constexpr double kDamageFreeModeDisableLossThreshold = 0.10;
 
 std::int64_t steady_now_ms()
 {
@@ -138,6 +140,7 @@ ReceiverSession::ReceiverSession(const Config& config,
     : config_(config)
     , signaling_(std::move(signaling))
     , loop_(loop)
+    , guard_frame_channel_(config.guard_stream_mtu_bytes)
 {
 }
 
@@ -162,8 +165,13 @@ bool ReceiverSession::start()
     }
     gst_bin_add(GST_BIN(pipeline_), webrtc_);
 
+    if (!create_display_pipeline()) {
+        return false;
+    }
+
     g_signal_connect(webrtc_, "pad-added", G_CALLBACK(&ReceiverSession::on_incoming_stream), this);
     g_signal_connect(webrtc_, "on-ice-candidate", G_CALLBACK(&ReceiverSession::on_ice_candidate), this);
+    g_signal_connect(webrtc_, "on-data-channel", G_CALLBACK(&ReceiverSession::on_data_channel), this);
 
     signaling_->set_message_handler([this](const SignalingMessage& message) {
         handle_signaling_message(message);
@@ -187,13 +195,36 @@ void ReceiverSession::stop()
         metrics_timer_id_ = 0;
     }
 
+    if (display_selector_ && main_selector_pad_) {
+        gst_element_release_request_pad(display_selector_, main_selector_pad_);
+        gst_object_unref(main_selector_pad_);
+        main_selector_pad_ = nullptr;
+    }
+    if (display_selector_ && guard_selector_pad_) {
+        gst_element_release_request_pad(display_selector_, guard_selector_pad_);
+        gst_object_unref(guard_selector_pad_);
+        guard_selector_pad_ = nullptr;
+    }
+
     if (pipeline_) {
         gst_element_set_state(pipeline_, GST_STATE_NULL);
         gst_object_unref(pipeline_);
         pipeline_ = nullptr;
         webrtc_ = nullptr;
-        display_valve_ = nullptr;
+        display_selector_ = nullptr;
+        display_convert_ = nullptr;
+        display_sink_ = nullptr;
+        guard_appsrc_ = nullptr;
     }
+    if (guard_channel_) {
+        g_object_unref(guard_channel_);
+        guard_channel_ = nullptr;
+    }
+
+    pending_guard_frames_.clear();
+    guard_channel_open_ = false;
+    guard_frame_ready_ = false;
+    using_guard_display_ = false;
 }
 
 void ReceiverSession::handle_signaling_message(const SignalingMessage& message)
@@ -284,9 +315,106 @@ void ReceiverSession::add_ice_candidate(unsigned int mline_index, const std::str
     g_signal_emit_by_name(webrtc_, "add-ice-candidate", mline_index, candidate.c_str());
 }
 
+bool ReceiverSession::create_display_pipeline()
+{
+    display_selector_ = gst_element_factory_make("input-selector", "display_selector");
+    display_convert_ = gst_element_factory_make("videoconvert", "display_convert");
+    display_sink_ = gst_element_factory_make(config_.receiver_sink.c_str(), "display_sink");
+    guard_appsrc_ = gst_element_factory_make("appsrc", "guard_appsrc");
+    auto* guard_queue = gst_element_factory_make("queue", "guard_queue");
+    auto* guard_decoder = gst_element_factory_make("jpegdec", "guard_decoder");
+    auto* guard_convert = gst_element_factory_make("videoconvert", "guard_convert");
+
+    if (!display_selector_ || !display_convert_ || !display_sink_ ||
+        !guard_appsrc_ || !guard_queue || !guard_decoder || !guard_convert) {
+        Logger::error("创建接收端显示链路失败。");
+        return false;
+    }
+
+    auto* guard_caps = gst_caps_new_simple(
+        "image/jpeg",
+        "framerate", GST_TYPE_FRACTION, static_cast<int>(std::max(1u, config_.guard_stream_fps)), 1,
+        nullptr);
+    g_object_set(guard_appsrc_,
+                 "caps", guard_caps,
+                 "format", GST_FORMAT_TIME,
+                 "is-live", TRUE,
+                 "do-timestamp", TRUE,
+                 "block", FALSE,
+                 nullptr);
+    gst_caps_unref(guard_caps);
+    g_object_set(display_sink_, "sync", FALSE, nullptr);
+
+    gst_bin_add_many(GST_BIN(pipeline_),
+                     display_selector_,
+                     display_convert_,
+                     display_sink_,
+                     guard_appsrc_,
+                     guard_queue,
+                     guard_decoder,
+                     guard_convert,
+                     nullptr);
+
+    gst_element_sync_state_with_parent(display_selector_);
+    gst_element_sync_state_with_parent(display_convert_);
+    gst_element_sync_state_with_parent(display_sink_);
+    gst_element_sync_state_with_parent(guard_appsrc_);
+    gst_element_sync_state_with_parent(guard_queue);
+    gst_element_sync_state_with_parent(guard_decoder);
+    gst_element_sync_state_with_parent(guard_convert);
+
+    if (!gst_element_link_many(display_selector_, display_convert_, display_sink_, nullptr) ||
+        !gst_element_link_many(guard_appsrc_, guard_queue, guard_decoder, guard_convert, nullptr)) {
+        Logger::error("接收端显示链路连接失败。");
+        return false;
+    }
+
+    guard_selector_pad_ = gst_element_get_request_pad(display_selector_, "sink_%u");
+    if (!guard_selector_pad_) {
+        Logger::error("无法为 guard 显示链路申请 selector pad。");
+        return false;
+    }
+
+    if (auto* guard_src_pad = gst_element_get_static_pad(guard_convert, "src")) {
+        if (gst_pad_link(guard_src_pad, guard_selector_pad_) != GST_PAD_LINK_OK) {
+            gst_object_unref(guard_src_pad);
+            Logger::error("guard 显示链路连接到 selector 失败。");
+            return false;
+        }
+        gst_object_unref(guard_src_pad);
+    }
+
+    set_display_mode(false);
+    return true;
+}
+
 void ReceiverSession::on_incoming_stream(GstElement*, GstPad* pad, gpointer user_data)
 {
     static_cast<ReceiverSession*>(user_data)->link_decode_chain(pad);
+}
+
+void ReceiverSession::on_data_channel(GstElement*, GstWebRTCDataChannel* channel, gpointer user_data)
+{
+    auto* self = static_cast<ReceiverSession*>(user_data);
+    if (!self || !channel) {
+        return;
+    }
+
+    gchar* label = nullptr;
+    g_object_get(channel, "label", &label, nullptr);
+    const std::string channel_label = label ? label : "";
+    g_free(label);
+
+    if (channel_label != "guard-frame") {
+        return;
+    }
+
+    if (self->guard_channel_) {
+        g_object_unref(self->guard_channel_);
+    }
+    self->guard_channel_ = GST_WEBRTC_DATA_CHANNEL(g_object_ref(channel));
+    self->bind_guard_channel_signals(self->guard_channel_);
+    Logger::info("receiver attached guard-frame data channel.");
 }
 
 GstPadProbeReturn ReceiverSession::on_decoded_input_probe(GstPad*, GstPadProbeInfo* info, gpointer user_data)
@@ -333,7 +461,7 @@ GstPadProbeReturn ReceiverSession::on_rtp_event_probe(GstPad*, GstPadProbeInfo* 
 
     const auto* name = gst_structure_get_name(structure);
     if (name && std::string(name) == "GstRTPPacketLost") {
-        static_cast<ReceiverSession*>(user_data)->set_display_freeze(true);
+        (void)user_data;
     }
 
     return GST_PAD_PROBE_OK;
@@ -350,15 +478,12 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
     auto* depay = gst_element_factory_make("rtph264depay", nullptr);
     auto* parse = gst_element_factory_make("h264parse", nullptr);
     auto* decoder = gst_element_factory_make("avdec_h264", nullptr);
-    auto* valve = gst_element_factory_make("valve", nullptr);
     auto* convert = gst_element_factory_make("videoconvert", nullptr);
-    auto* sink = gst_element_factory_make(config_.receiver_sink.c_str(), nullptr);
 
-    if (!queue || !depay || !parse || !decoder || !valve || !convert || !sink) {
+    if (!queue || !depay || !parse || !decoder || !convert || !display_selector_) {
         Logger::error("创建接收端解码链路失败，请确认 libav/good/bad 插件已安装。");
         return;
     }
-    display_valve_ = valve;
 
     set_boolean_property_if_present(depay, "request-keyframe", TRUE);
     set_boolean_property_if_present(depay, "wait-for-keyframe", TRUE);
@@ -387,62 +512,249 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
             gst_object_unref(jitter_src_pad);
         }
 
-        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, valve, convert, sink, nullptr);
+        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, convert, nullptr);
         gst_element_sync_state_with_parent(queue);
         gst_element_sync_state_with_parent(depay);
         gst_element_sync_state_with_parent(parse);
         gst_element_sync_state_with_parent(decoder);
-        gst_element_sync_state_with_parent(valve);
         gst_element_sync_state_with_parent(convert);
-        gst_element_sync_state_with_parent(sink);
 
-        if (!gst_element_link_many(queue, jitterbuffer, depay, parse, decoder, valve, convert, sink, nullptr)) {
+        if (!gst_element_link_many(queue, jitterbuffer, depay, parse, decoder, convert, nullptr)) {
             Logger::error("接收端解码链路连接失败。");
             return;
         }
     } else {
-        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, valve, convert, sink, nullptr);
+        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, convert, nullptr);
         gst_element_sync_state_with_parent(queue);
         gst_element_sync_state_with_parent(depay);
         gst_element_sync_state_with_parent(parse);
         gst_element_sync_state_with_parent(decoder);
-        gst_element_sync_state_with_parent(valve);
         gst_element_sync_state_with_parent(convert);
-        gst_element_sync_state_with_parent(sink);
 
-        if (!gst_element_link_many(queue, depay, parse, decoder, valve, convert, sink, nullptr)) {
+        if (!gst_element_link_many(queue, depay, parse, decoder, convert, nullptr)) {
             Logger::error("接收端解码链路连接失败。");
             return;
         }
     }
-
-    g_object_set(sink, "sync", FALSE, nullptr);
 
     auto* sink_pad = gst_element_get_static_pad(queue, "sink");
     if (gst_pad_link(pad, sink_pad) != GST_PAD_LINK_OK) {
         Logger::error("WebRTC 输入 pad 连接到解码链路失败。");
     } else {
+        if (main_selector_pad_) {
+            gst_element_release_request_pad(display_selector_, main_selector_pad_);
+            gst_object_unref(main_selector_pad_);
+            main_selector_pad_ = nullptr;
+        }
+
+        main_selector_pad_ = gst_element_get_request_pad(display_selector_, "sink_%u");
+        if (!main_selector_pad_) {
+            Logger::error("无法为主视频链路申请 selector pad。");
+            gst_object_unref(sink_pad);
+            return;
+        }
+
+        if (auto* convert_src_pad = gst_element_get_static_pad(convert, "src")) {
+            if (gst_pad_link(convert_src_pad, main_selector_pad_) != GST_PAD_LINK_OK) {
+                gst_object_unref(convert_src_pad);
+                Logger::error("主视频链路连接到 selector 失败。");
+                gst_object_unref(sink_pad);
+                return;
+            }
+            gst_object_unref(convert_src_pad);
+        }
+
         Logger::info("接收端解码链路已连接。");
+        if (!using_guard_display_) {
+            set_display_mode(false);
+        }
     }
     gst_object_unref(sink_pad);
 }
 
-void ReceiverSession::set_display_freeze(bool freeze)
+void ReceiverSession::update_keyframe_only_mode(double packet_loss_ratio, std::int64_t now_ms)
 {
-    if (display_frozen_ == freeze) {
+    if (packet_loss_ratio > kDamageFreeModeEnableLossThreshold) {
+        low_loss_since_ms_ = 0;
+        if (!keyframe_only_mode_) {
+            keyframe_only_mode_ = true;
+            Logger::warn("receiver enters damage-free mode: only complete keyframes are displayed while loss stays above 10%.");
+            if (guard_frame_ready_) {
+                set_display_mode(true);
+            }
+        }
         return;
     }
 
-    display_frozen_ = freeze;
-    if (display_valve_) {
-        g_object_set(display_valve_, "drop", freeze ? TRUE : FALSE, nullptr);
+    if (!keyframe_only_mode_) {
+        low_loss_since_ms_ = 0;
+        return;
     }
 
-    if (freeze) {
-        Logger::warn("receiver freezes display after RTP packet loss to avoid corrupted frames.");
-    } else {
-        Logger::info("receiver resumes display output.");
+    if (packet_loss_ratio >= kDamageFreeModeDisableLossThreshold) {
+        low_loss_since_ms_ = 0;
+        return;
     }
+
+    if (low_loss_since_ms_ == 0) {
+        low_loss_since_ms_ = now_ms;
+        return;
+    }
+
+    if (now_ms - low_loss_since_ms_ >= static_cast<std::int64_t>(config_.upshift_window_ms)) {
+        keyframe_only_mode_ = false;
+        low_loss_since_ms_ = 0;
+        set_display_mode(false);
+        Logger::info("receiver leaves damage-free mode after stable packet loss below 10%.");
+    }
+}
+
+void ReceiverSession::bind_guard_channel_signals(GstWebRTCDataChannel* channel)
+{
+    if (!channel) {
+        return;
+    }
+
+    g_signal_connect(channel, "on-open", G_CALLBACK(&ReceiverSession::on_guard_channel_open), this);
+    g_signal_connect(channel, "on-close", G_CALLBACK(&ReceiverSession::on_guard_channel_close), this);
+    g_signal_connect(channel, "on-message-data", G_CALLBACK(&ReceiverSession::on_guard_channel_message_data), this);
+}
+
+void ReceiverSession::handle_guard_packet(const GuardFramePacket& packet)
+{
+    auto& pending = pending_guard_frames_[packet.frame_id];
+    if (pending.packet_count == 0) {
+        pending.packet_count = packet.packet_count;
+        pending.crc32 = packet.crc32;
+        pending.packets.reserve(packet.packet_count);
+    }
+
+    if (pending.packet_count != packet.packet_count || pending.crc32 != packet.crc32) {
+        pending_guard_frames_.erase(packet.frame_id);
+        return;
+    }
+
+    for (const auto& existing : pending.packets) {
+        if (existing.packet_index == packet.packet_index) {
+            return;
+        }
+    }
+
+    pending.packets.push_back(packet);
+    cleanup_stale_guard_frames(packet.frame_id);
+
+    if (pending.packets.size() != pending.packet_count) {
+        return;
+    }
+
+    std::vector<std::uint8_t> frame;
+    if (!guard_frame_channel_.reassemble(pending.packets, frame)) {
+        pending_guard_frames_.erase(packet.frame_id);
+        Logger::warn("receiver dropped incomplete/corrupted guard frame.");
+        return;
+    }
+
+    last_completed_guard_frame_id_ = packet.frame_id;
+    pending_guard_frames_.erase(packet.frame_id);
+    push_guard_frame(frame);
+}
+
+void ReceiverSession::push_guard_frame(const std::vector<std::uint8_t>& jpeg_frame)
+{
+    if (!guard_appsrc_ || jpeg_frame.empty()) {
+        return;
+    }
+
+    auto* buffer = gst_buffer_new_allocate(nullptr, jpeg_frame.size(), nullptr);
+    if (!buffer) {
+        return;
+    }
+
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+        gst_buffer_unref(buffer);
+        return;
+    }
+
+    std::memcpy(map.data, jpeg_frame.data(), jpeg_frame.size());
+    gst_buffer_unmap(buffer, &map);
+
+    if (gst_app_src_push_buffer(GST_APP_SRC(guard_appsrc_), buffer) != GST_FLOW_OK) {
+        Logger::warn("failed to push guard JPEG frame to display pipeline.");
+        return;
+    }
+
+    guard_frame_ready_ = true;
+    if (keyframe_only_mode_) {
+        set_display_mode(true);
+    }
+}
+
+void ReceiverSession::set_display_mode(bool use_guard)
+{
+    if (!display_selector_) {
+        return;
+    }
+
+    GstPad* target_pad = use_guard ? guard_selector_pad_ : main_selector_pad_;
+    if (!target_pad) {
+        return;
+    }
+
+    g_object_set(display_selector_, "active-pad", target_pad, nullptr);
+    using_guard_display_ = use_guard;
+}
+
+void ReceiverSession::cleanup_stale_guard_frames(std::uint32_t newest_frame_id)
+{
+    constexpr std::uint32_t kKeepWindow = 4;
+    for (auto it = pending_guard_frames_.begin(); it != pending_guard_frames_.end();) {
+        if (it->first + kKeepWindow < newest_frame_id || it->first <= last_completed_guard_frame_id_) {
+            it = pending_guard_frames_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ReceiverSession::on_guard_channel_open(GObject*, gpointer user_data)
+{
+    auto* self = static_cast<ReceiverSession*>(user_data);
+    if (!self) {
+        return;
+    }
+
+    self->guard_channel_open_ = true;
+    Logger::info("receiver guard-frame data channel is open.");
+}
+
+void ReceiverSession::on_guard_channel_close(GObject*, gpointer user_data)
+{
+    auto* self = static_cast<ReceiverSession*>(user_data);
+    if (!self) {
+        return;
+    }
+
+    self->guard_channel_open_ = false;
+    Logger::warn("receiver guard-frame data channel is closed.");
+}
+
+void ReceiverSession::on_guard_channel_message_data(GObject*, GBytes* bytes, gpointer user_data)
+{
+    auto* self = static_cast<ReceiverSession*>(user_data);
+    if (!self || !bytes) {
+        return;
+    }
+
+    gsize size = 0;
+    const auto* data = static_cast<const std::uint8_t*>(g_bytes_get_data(bytes, &size));
+    GuardFramePacket packet;
+    if (!GuardFrameChannel::deserialize_packet(data, size, packet)) {
+        Logger::warn("receiver ignored malformed guard packet.");
+        return;
+    }
+
+    self->handle_guard_packet(packet);
 }
 
 void ReceiverSession::on_ice_candidate(GstElement*, guint mlineindex, gchar* candidate, gpointer user_data)
@@ -533,15 +845,7 @@ void ReceiverSession::on_stats_ready(GstPromise* promise, gpointer user_data)
     metrics.rtt_ms = rtt_ms;
     metrics.jitter_ms = jitter_ms;
 
-    if (metrics.packet_loss_ratio >= kKeyframeOnlyEnableLossThreshold && !self->keyframe_only_mode_) {
-        self->keyframe_only_mode_ = true;
-        self->set_display_freeze(true);
-        Logger::warn("receiver enters keyframe-only mode: dropping delta frames to avoid corrupted output.");
-    } else if (metrics.packet_loss_ratio < kKeyframeOnlyDisableLossThreshold && self->keyframe_only_mode_) {
-        self->keyframe_only_mode_ = false;
-        self->set_display_freeze(false);
-        Logger::info("receiver leaves keyframe-only mode.");
-    }
+    self->update_keyframe_only_mode(metrics.packet_loss_ratio, now_ms);
 
     if (self->last_metrics_ms_ > 0 && now_ms > self->last_metrics_ms_ && bytes_received >= self->last_bytes_received_) {
         const auto delta_bytes = bytes_received - self->last_bytes_received_;

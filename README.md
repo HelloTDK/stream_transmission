@@ -100,6 +100,13 @@ cmake --build build -j
 Windows / MSVC：
 
 ```powershell
+$env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = "D:\SoftWare\Gstream_msvc_x86_64"
+$env:PKG_CONFIG_PATH = "D:\SoftWare\Gstream_msvc_x86_64\lib\pkgconfig"
+$env:Path = "D:\SoftWare\Gstream_msvc_x86_64\bin;$env:Path"
+
+Test-Path "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\lib\pkgconfig"
+Get-ChildItem "$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\lib\pkgconfig\gstreamer-1.0.pc
+
 cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64
 cmake --build build-win --config Release
 ```

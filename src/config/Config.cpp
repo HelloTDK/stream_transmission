@@ -168,6 +168,8 @@ bool Config::load_from_file(const std::string& path, Config& out)
     out.video_encoder = get_string(values, "video.encoder", out.video_encoder);
     out.encoder_bitrate_property = get_string(values, "video.encoder_bitrate_property", out.encoder_bitrate_property);
     out.encoder_bitrate_unit = get_string(values, "video.encoder_bitrate_unit", out.encoder_bitrate_unit);
+    out.rtp_mtu_bytes = get_u32(values, "video.rtp_mtu_bytes", out.rtp_mtu_bytes);
+    out.damage_free_rtp_mtu_bytes = get_u32(values, "video.damage_free_rtp_mtu_bytes", out.damage_free_rtp_mtu_bytes);
     out.max_bitrate_kbps = get_u32(values, "video.max_bitrate_kbps", out.max_bitrate_kbps);
     out.min_bitrate_kbps = get_u32(values, "video.min_bitrate_kbps", out.min_bitrate_kbps);
     out.initial_width = get_u32(values, "video.initial_width", out.initial_width);
@@ -211,6 +213,7 @@ bool Config::load_from_file(const std::string& path, Config& out)
     out.guard_stream_fps = get_u32(values, "guard_stream.fps", out.guard_stream_fps);
     out.guard_stream_mtu_bytes = get_u32(values, "guard_stream.mtu_bytes", out.guard_stream_mtu_bytes);
     out.guard_stream_repeat_count = get_u32(values, "guard_stream.repeat_count", out.guard_stream_repeat_count);
+    out.guard_stream_jpeg_quality = get_u32(values, "guard_stream.jpeg_quality", out.guard_stream_jpeg_quality);
 
     return true;
 }

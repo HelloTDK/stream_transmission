@@ -16,6 +16,10 @@ signaling:
 video:
     source: uridecodebin uri=<rtsp_url>
     encoder: x264enc
+    encoder_bitrate_property: bitrate
+    encoder_bitrate_unit: kbps
+    rtp_mtu_bytes: 1000
+    damage_free_rtp_mtu_bytes: 700
     max_bitrate_kbps: 1500
     min_bitrate_kbps: 150
     initial_width: 1280
@@ -93,9 +97,10 @@ receiver:
 
 guard_stream:
   enabled: true                                   # 极端丢包保底图像通道开关预留；当前仅有分包/校验骨架
-  loss_threshold_percent: 80                      # 保底通道触发丢包率阈值，单位百分比
+  loss_threshold_percent: 10                      # 保底图像通道触发丢包率阈值，单位百分比；高于 10% 就切完整帧保底
   width: 320                                      # 保底图像宽度，单位像素
-  height: 240                                     # 保底图像高度，单位像素
-  fps: 2                                         # 保底图像发送帧率；低频完整图像优先
+  height: 180                                     # 保底图像高度，单位像素
+  fps: 2                                          # 保底图像发送帧率；低频完整图像优先
   mtu_bytes: 900                                  # 保底图像分包 MTU，单位字节
-  repeat_count: 2                                 # 保底图像关键包重复发送次数预留，用于提升极端丢包下成功率
+  repeat_count: 3                                 # 保底图像关键包重复发送次数，用于提升极端丢包下成功率
+  jpeg_quality: 55                                # 保底 JPEG 质量；控制单帧体积，优先保证完整到达

@@ -27,6 +27,8 @@ public:
 
     std::vector<GuardFramePacket> packetize(std::uint32_t frame_id, const std::vector<std::uint8_t>& encoded_frame) const;
     bool reassemble(const std::vector<GuardFramePacket>& packets, std::vector<std::uint8_t>& out_frame) const;
+    static std::vector<std::uint8_t> serialize_packet(const GuardFramePacket& packet);
+    static bool deserialize_packet(const std::uint8_t* data, std::size_t size, GuardFramePacket& out_packet);
 
 private:
     static std::uint32_t crc32(const std::vector<std::uint8_t>& data);

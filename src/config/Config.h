@@ -22,6 +22,8 @@ struct Config {
     std::string video_encoder = "x264enc";
     std::string encoder_bitrate_property = "bitrate";
     std::string encoder_bitrate_unit = "kbps";
+    std::uint32_t rtp_mtu_bytes = 1000;
+    std::uint32_t damage_free_rtp_mtu_bytes = 700;
 
     std::uint32_t max_bitrate_kbps = 8000;
     std::uint32_t min_bitrate_kbps = 80;
@@ -70,6 +72,7 @@ struct Config {
     std::uint32_t guard_stream_fps = 2;
     std::uint32_t guard_stream_mtu_bytes = 900;
     std::uint32_t guard_stream_repeat_count = 2;
+    std::uint32_t guard_stream_jpeg_quality = 60;
 
     AdaptiveConfig adaptive_config() const;
 

@@ -14,12 +14,24 @@ video:
   encoder: x264enc
   encoder_bitrate_property: bitrate
   encoder_bitrate_unit: kbps
+  rtp_mtu_bytes: 1000
+  damage_free_rtp_mtu_bytes: 700
   max_bitrate_kbps: 8000
   min_bitrate_kbps: 80
   initial_width: 2560
   initial_height: 720
   initial_fps: 30
   keyframe_interval: 30
+
+guard_stream:
+  enabled: true
+  loss_threshold_percent: 10
+  width: 320
+  height: 180
+  fps: 2
+  mtu_bytes: 900
+  repeat_count: 3
+  jpeg_quality: 55
 
 receiver:
   sink: autovideosink

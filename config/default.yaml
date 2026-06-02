@@ -24,6 +24,8 @@ video:
   encoder: x264enc                                # H.264 编码器名称；默认使用 x264 软件编码
   encoder_bitrate_property: bitrate               # 编码器码率属性名；不同硬编插件可能不同
   encoder_bitrate_unit: kbps                      # 编码器码率属性单位；支持 kbps 或 bps
+  rtp_mtu_bytes: 1000                             # 常规 RTP 分片大小；值越小越不容易一丢毁整帧，但包头开销会增大
+  damage_free_rtp_mtu_bytes: 700                  # 无花屏模式下进一步缩小 RTP 分片，降低关键帧单片丢失破坏范围
 
   max_bitrate_kbps: 8000                          # 自适应码率上限，单位 kbps；2560x720 双目正常网络需要更高码率
   min_bitrate_kbps: 80                            # 自适应码率下限，单位 kbps；极端弱网下仍保留可识别图像
@@ -103,9 +105,10 @@ receiver:
 
 guard_stream:
   enabled: true                                   # 极端丢包保底图像通道开关预留；当前仅有分包/校验骨架
-  loss_threshold_percent: 80                      # 保底通道触发丢包率阈值，单位百分比
+  loss_threshold_percent: 10                      # 保底图像通道触发丢包率阈值，单位百分比；高于 10% 就切完整帧保底
   width: 320                                      # 保底图像宽度，单位像素
-  height: 240                                     # 保底图像高度，单位像素
-  fps: 2                                         # 保底图像发送帧率；低频完整图像优先
+  height: 180                                     # 保底图像高度，单位像素；与 32:9 主画面比例一致
+  fps: 2                                          # 保底图像发送帧率；低频完整图像优先
   mtu_bytes: 900                                  # 保底图像分包 MTU，单位字节
-  repeat_count: 2                                 # 保底图像关键包重复发送次数预留，用于提升极端丢包下成功率
+  repeat_count: 3                                 # 保底图像关键包重复发送次数；弱网下用冗余换整帧成功率
+  jpeg_quality: 55                                # 保底 JPEG 质量；控制单帧体积，优先保证完整到达
