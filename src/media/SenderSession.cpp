@@ -572,12 +572,10 @@ void SenderSession::on_ice_candidate(GstElement*, guint mlineindex, gchar* candi
 
 gboolean SenderSession::on_metrics_timer(gpointer user_data)
 {
-    auto* self = static_cast<SenderSession*>(user_data);
-
-    // 当前控制台信令版本主要接收对端 metrics 消息。
-    // 后续可在这里调用 webrtcbin get-stats，把 RTCP 统计直接转成 NetworkMetrics。
-    const auto profile = self->adaptive_.current_profile();
-    self->apply_profile(profile);
+    (void)user_data;
+    // 当前控制台信令版本主要依赖接收端回传的 metrics 做自适应。
+    // 不要在定时器里重复 apply 当前 profile，否则会导致无意义的重复日志，
+    // 也会增加动态 caps/property 更新频率，给 RTSP 源链路带来额外协商压力。
     return G_SOURCE_CONTINUE;
 }
 

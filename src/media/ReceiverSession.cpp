@@ -215,6 +215,7 @@ void ReceiverSession::stop()
         display_convert_ = nullptr;
         display_sink_ = nullptr;
         guard_appsrc_ = nullptr;
+        main_display_valve_ = nullptr;
     }
     if (guard_channel_) {
         g_object_unref(guard_channel_);
@@ -225,6 +226,8 @@ void ReceiverSession::stop()
     guard_channel_open_ = false;
     guard_frame_ready_ = false;
     using_guard_display_ = false;
+    recovery_pending_ = false;
+    main_video_blocked_ = false;
 }
 
 void ReceiverSession::handle_signaling_message(const SignalingMessage& message)
@@ -440,6 +443,15 @@ GstPadProbeReturn ReceiverSession::on_decoded_input_probe(GstPad*, GstPadProbeIn
         return GST_PAD_PROBE_DROP;
     }
 
+    if (self && self->recovery_pending_ &&
+        (flags & GST_BUFFER_FLAG_DELTA_UNIT) == 0) {
+        self->recovery_pending_ = false;
+        self->keyframe_only_mode_ = false;
+        self->set_main_video_blocked(false);
+        self->set_display_mode(false);
+        Logger::info("receiver restored main video after a clean recovery keyframe.");
+    }
+
     return GST_PAD_PROBE_OK;
 }
 
@@ -478,12 +490,14 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
     auto* depay = gst_element_factory_make("rtph264depay", nullptr);
     auto* parse = gst_element_factory_make("h264parse", nullptr);
     auto* decoder = gst_element_factory_make("avdec_h264", nullptr);
+    auto* valve = gst_element_factory_make("valve", nullptr);
     auto* convert = gst_element_factory_make("videoconvert", nullptr);
 
-    if (!queue || !depay || !parse || !decoder || !convert || !display_selector_) {
+    if (!queue || !depay || !parse || !decoder || !valve || !convert || !display_selector_) {
         Logger::error("创建接收端解码链路失败，请确认 libav/good/bad 插件已安装。");
         return;
     }
+    main_display_valve_ = valve;
 
     set_boolean_property_if_present(depay, "request-keyframe", TRUE);
     set_boolean_property_if_present(depay, "wait-for-keyframe", TRUE);
@@ -492,9 +506,9 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
     set_boolean_property_if_present(decoder, "output-corrupt", FALSE);
     set_boolean_property_if_present(decoder, "discard-corrupted-frames", TRUE);
 
-    if (auto* parse_src_pad = gst_element_get_static_pad(parse, "src")) {
-        gst_pad_add_probe(parse_src_pad, GST_PAD_PROBE_TYPE_BUFFER, &ReceiverSession::on_decoded_input_probe, this, nullptr);
-        gst_object_unref(parse_src_pad);
+    if (auto* decoder_src_pad = gst_element_get_static_pad(decoder, "src")) {
+        gst_pad_add_probe(decoder_src_pad, GST_PAD_PROBE_TYPE_BUFFER, &ReceiverSession::on_decoded_input_probe, this, nullptr);
+        gst_object_unref(decoder_src_pad);
     }
 
     if (auto* jitterbuffer = gst_element_factory_make("rtpjitterbuffer", nullptr)) {
@@ -512,26 +526,28 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
             gst_object_unref(jitter_src_pad);
         }
 
-        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, convert, nullptr);
+        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, valve, convert, nullptr);
         gst_element_sync_state_with_parent(queue);
         gst_element_sync_state_with_parent(depay);
         gst_element_sync_state_with_parent(parse);
         gst_element_sync_state_with_parent(decoder);
+        gst_element_sync_state_with_parent(valve);
         gst_element_sync_state_with_parent(convert);
 
-        if (!gst_element_link_many(queue, jitterbuffer, depay, parse, decoder, convert, nullptr)) {
+        if (!gst_element_link_many(queue, jitterbuffer, depay, parse, decoder, valve, convert, nullptr)) {
             Logger::error("接收端解码链路连接失败。");
             return;
         }
     } else {
-        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, convert, nullptr);
+        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, valve, convert, nullptr);
         gst_element_sync_state_with_parent(queue);
         gst_element_sync_state_with_parent(depay);
         gst_element_sync_state_with_parent(parse);
         gst_element_sync_state_with_parent(decoder);
+        gst_element_sync_state_with_parent(valve);
         gst_element_sync_state_with_parent(convert);
 
-        if (!gst_element_link_many(queue, depay, parse, decoder, convert, nullptr)) {
+        if (!gst_element_link_many(queue, depay, parse, decoder, valve, convert, nullptr)) {
             Logger::error("接收端解码链路连接失败。");
             return;
         }
@@ -576,9 +592,11 @@ void ReceiverSession::update_keyframe_only_mode(double packet_loss_ratio, std::i
 {
     if (packet_loss_ratio > kDamageFreeModeEnableLossThreshold) {
         low_loss_since_ms_ = 0;
+        recovery_pending_ = false;
         if (!keyframe_only_mode_) {
             keyframe_only_mode_ = true;
-            Logger::warn("receiver enters damage-free mode: only complete keyframes are displayed while loss stays above 10%.");
+            set_main_video_blocked(true);
+            Logger::warn("receiver enters guard-only mode: the main H.264 display is blocked while loss stays above 10%.");
             if (guard_frame_ready_) {
                 set_display_mode(true);
             }
@@ -596,16 +614,19 @@ void ReceiverSession::update_keyframe_only_mode(double packet_loss_ratio, std::i
         return;
     }
 
+    if (recovery_pending_) {
+        return;
+    }
+
     if (low_loss_since_ms_ == 0) {
         low_loss_since_ms_ = now_ms;
         return;
     }
 
     if (now_ms - low_loss_since_ms_ >= static_cast<std::int64_t>(config_.upshift_window_ms)) {
-        keyframe_only_mode_ = false;
         low_loss_since_ms_ = 0;
-        set_display_mode(false);
-        Logger::info("receiver leaves damage-free mode after stable packet loss below 10%.");
+        recovery_pending_ = true;
+        Logger::info("receiver is waiting for a clean recovery keyframe before restoring the main video.");
     }
 }
 
@@ -703,6 +724,16 @@ void ReceiverSession::set_display_mode(bool use_guard)
 
     g_object_set(display_selector_, "active-pad", target_pad, nullptr);
     using_guard_display_ = use_guard;
+}
+
+void ReceiverSession::set_main_video_blocked(bool blocked)
+{
+    if (!main_display_valve_ || main_video_blocked_ == blocked) {
+        return;
+    }
+
+    g_object_set(main_display_valve_, "drop", blocked ? TRUE : FALSE, nullptr);
+    main_video_blocked_ = blocked;
 }
 
 void ReceiverSession::cleanup_stale_guard_frames(std::uint32_t newest_frame_id)

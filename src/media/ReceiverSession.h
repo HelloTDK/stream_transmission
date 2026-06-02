@@ -53,6 +53,7 @@ private:
     void handle_guard_packet(const GuardFramePacket& packet);
     void push_guard_frame(const std::vector<std::uint8_t>& jpeg_frame);
     void set_display_mode(bool use_guard);
+    void set_main_video_blocked(bool blocked);
     void cleanup_stale_guard_frames(std::uint32_t newest_frame_id);
 
     Config config_;
@@ -64,6 +65,7 @@ private:
     GstElement* display_convert_ = nullptr;
     GstElement* display_sink_ = nullptr;
     GstElement* guard_appsrc_ = nullptr;
+    GstElement* main_display_valve_ = nullptr;
     GstWebRTCDataChannel* guard_channel_ = nullptr;
     GstPad* main_selector_pad_ = nullptr;
     GstPad* guard_selector_pad_ = nullptr;
@@ -77,6 +79,8 @@ private:
     bool guard_channel_open_ = false;
     bool guard_frame_ready_ = false;
     bool using_guard_display_ = false;
+    bool recovery_pending_ = false;
+    bool main_video_blocked_ = false;
     bool keyframe_only_mode_ = false;
     GuardFrameChannel guard_frame_channel_;
     std::unordered_map<std::uint32_t, PendingGuardFrame> pending_guard_frames_;

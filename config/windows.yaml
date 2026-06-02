@@ -34,7 +34,7 @@ guard_stream:
   jpeg_quality: 55
 
 receiver:
-  sink: autovideosink
+  sink: d3d11videosink
   hold_last_frame: true
   jitter_buffer_latency_ms: 120
   drop_late_frames: true
