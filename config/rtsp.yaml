@@ -14,7 +14,8 @@ signaling:
   room: weaknet-demo                             # 信令房间/会话 ID 预留，用于后续让发送端和接收端自动匹配
 
 video:
-    source: uridecodebin uri=<rtsp_url>
+    # 将 <rtsp_url> 替换成实际 RTSP 地址。这里强制 RTSP-over-TCP，避免弱网丢包工具先打坏发送端输入源。
+    source: rtspsrc location=<rtsp_url> protocols=tcp latency=200 drop-on-latency=true tcp-timeout=5000000 ! application/x-rtp,media=video,encoding-name=H264 ! rtph264depay ! h264parse config-interval=1 ! avdec_h264
     encoder: x264enc
     encoder_bitrate_property: bitrate
     encoder_bitrate_unit: kbps

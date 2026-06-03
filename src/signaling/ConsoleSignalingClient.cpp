@@ -255,22 +255,28 @@ void ConsoleSignalingClient::run_tcp_server(const std::string& host, unsigned sh
     }
 
     Logger::info("TCP 信令监听中: " + host + ":" + std::to_string(port));
-    const auto fd = static_cast<SocketHandle>(::accept(listen_fd_, nullptr, nullptr));
-    if (!is_valid_socket(fd)) {
-        if (running_) {
-            Logger::error("接受 TCP 信令连接失败: " + socket_error());
+    while (running_) {
+        const auto fd = static_cast<SocketHandle>(::accept(listen_fd_, nullptr, nullptr));
+        if (!is_valid_socket(fd)) {
+            if (running_) {
+                Logger::error("接受 TCP 信令连接失败: " + socket_error());
+            }
+            break;
         }
-        close_socket();
-        return;
+
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            socket_fd_ = fd;
+            flush_pending_locked();
+        }
+        Logger::info("TCP 信令已连接。");
+        read_socket_loop(fd);
+        if (running_) {
+            Logger::info("TCP 信令重新等待连接。");
+        }
     }
 
-    {
-        std::lock_guard<std::mutex> lock(socket_mutex_);
-        socket_fd_ = fd;
-        flush_pending_locked();
-    }
-    Logger::info("TCP 信令已连接。");
-    read_socket_loop(fd);
+    close_socket();
 }
 
 void ConsoleSignalingClient::run_tcp_client(const std::string& host, unsigned short port)
@@ -300,7 +306,11 @@ void ConsoleSignalingClient::run_tcp_client(const std::string& host, unsigned sh
             }
             Logger::info("TCP 信令已连接: " + host + ":" + std::to_string(port));
             read_socket_loop(fd);
-            return;
+            if (running_) {
+                Logger::info("TCP 信令将在断线后重连。");
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            }
+            continue;
         }
 
         auto mutable_fd = fd;
@@ -372,7 +382,7 @@ void ConsoleSignalingClient::read_socket_loop(SocketHandle fd)
         }
     }
 
-    close_socket();
+    close_connected_socket(fd);
     if (running_) {
         Logger::warn("TCP 信令连接已断开。");
     }
@@ -437,6 +447,18 @@ void ConsoleSignalingClient::close_socket()
     std::lock_guard<std::mutex> lock(socket_mutex_);
     close_fd(socket_fd_);
     close_fd(listen_fd_);
+}
+
+void ConsoleSignalingClient::close_connected_socket(SocketHandle fd)
+{
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    if (socket_fd_ == fd) {
+        close_fd(socket_fd_);
+        return;
+    }
+
+    auto mutable_fd = fd;
+    close_fd(mutable_fd);
 }
 
 } // namespace weaknet

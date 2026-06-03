@@ -57,6 +57,7 @@ private:
     bool send_socket_line(const std::string& line);
     bool send_socket_line_locked(const std::string& line);
     void flush_pending_locked();
+    void close_connected_socket(SocketHandle fd);
     void close_socket();
 
     MessageHandler handler_;
