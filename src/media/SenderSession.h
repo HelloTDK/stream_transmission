@@ -70,6 +70,13 @@ private:
     double last_packet_loss_ratio_ = 0.0;
     std::int64_t low_loss_since_ms_ = 0;
     std::uint32_t guard_frame_id_ = 0;
+    std::uint32_t applied_width_ = 0;
+    std::uint32_t applied_height_ = 0;
+    std::uint32_t applied_fps_ = 0;
+    std::uint32_t applied_bitrate_kbps_ = 0;
+    std::uint32_t applied_keyframe_interval_ = 0;
+    std::uint32_t applied_payloader_mtu_ = 0;
+    bool x264_static_options_applied_ = false;
     guint force_key_unit_count_ = 0;
     guint metrics_timer_id_ = 0;
     guint bus_watch_id_ = 0;

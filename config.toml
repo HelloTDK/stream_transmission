@@ -1,0 +1,58 @@
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+disable_response_storage = true
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+profile = "auto-max"
+file_opener = "vscode"
+model_provider = "https://api-cn.avemujica.moe/v1"
+web_search = "cached"
+suppress_unstable_features_warning = true
+model_context_window = 1_000_000
+model_auto_compact_token_limit = 900_000
+windows_wsl_setup_acknowledged = true
+
+[history]
+persistence = "save-all"
+
+[tui]
+notifications = true
+
+[shell_environment_policy]
+inherit = "all"
+ignore_default_excludes = false
+
+[sandbox_workspace_write]
+network_access = true
+
+[features]
+plan_tool = true
+apply_patch_freeform = true
+view_image_tool = true
+unified_exec = false
+streamable_shell = false
+rmcp_client = true
+elevated_windows_sandbox = true
+multi_agent = true
+
+[profiles.auto-max]
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+model = "gpt-5.4"
+model_reasoning_effort = "high"
+
+  [profiles.auto-max.windows]
+  sandbox = "elevated"
+
+[profiles.review]
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[windows]
+sandbox = "elevated"
+
+[model_providers."https://api-cn.avemujica.moe/v1"]
+name = "https://api-cn.avemujica.moe/v1"
+base_url = "https://api-cn.avemujica.moe/v1"
+wire_api = "responses"
+requires_openai_auth = true

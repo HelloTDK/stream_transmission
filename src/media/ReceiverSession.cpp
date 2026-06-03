@@ -132,6 +132,82 @@ void set_int_property_if_present(GstElement* element, const char* property_name,
     }
 }
 
+bool h264_nal_is_idr(std::uint8_t header)
+{
+    return (header & 0x1Fu) == 5u;
+}
+
+bool h264_annexb_contains_idr(const std::uint8_t* data, std::size_t size, bool& saw_start_code)
+{
+    saw_start_code = false;
+    for (std::size_t i = 0; i + 4 <= size; ++i) {
+        std::size_t start_code_size = 0;
+        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+            start_code_size = 3;
+        } else if (i + 5 <= size && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
+            start_code_size = 4;
+        }
+
+        if (start_code_size == 0) {
+            continue;
+        }
+
+        saw_start_code = true;
+        const auto nal_offset = i + start_code_size;
+        if (nal_offset < size && h264_nal_is_idr(data[nal_offset])) {
+            return true;
+        }
+
+        i = nal_offset;
+    }
+
+    return false;
+}
+
+bool h264_length_prefixed_contains_idr(const std::uint8_t* data, std::size_t size, std::size_t length_size)
+{
+    bool saw_nal = false;
+    std::size_t offset = 0;
+    while (offset + length_size <= size) {
+        std::uint32_t nal_size = 0;
+        for (std::size_t i = 0; i < length_size; ++i) {
+            nal_size = (nal_size << 8u) | data[offset + i];
+        }
+
+        offset += length_size;
+        if (nal_size == 0 || nal_size > size - offset) {
+            return false;
+        }
+
+        saw_nal = true;
+        if (h264_nal_is_idr(data[offset])) {
+            return true;
+        }
+        offset += nal_size;
+    }
+
+    return saw_nal && offset == size;
+}
+
+bool h264_buffer_contains_idr(GstBuffer* buffer)
+{
+    GstMapInfo map{};
+    if (!buffer || !gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        return false;
+    }
+
+    const auto* data = static_cast<const std::uint8_t*>(map.data);
+    const auto size = static_cast<std::size_t>(map.size);
+    bool saw_start_code = false;
+    const bool contains_idr = h264_annexb_contains_idr(data, size, saw_start_code) ||
+        (!saw_start_code &&
+         (h264_length_prefixed_contains_idr(data, size, 4) ||
+          h264_length_prefixed_contains_idr(data, size, 2)));
+
+    gst_buffer_unmap(buffer, &map);
+    return contains_idr;
+}
+
 } // namespace
 
 ReceiverSession::ReceiverSession(const Config& config,
@@ -165,6 +241,11 @@ bool ReceiverSession::start()
     }
     gst_bin_add(GST_BIN(pipeline_), webrtc_);
 
+    if (auto* bus = gst_element_get_bus(pipeline_)) {
+        bus_watch_id_ = gst_bus_add_watch(bus, &ReceiverSession::on_bus_message, this);
+        gst_object_unref(bus);
+    }
+
     if (!create_display_pipeline()) {
         return false;
     }
@@ -190,6 +271,11 @@ bool ReceiverSession::start()
 
 void ReceiverSession::stop()
 {
+    if (bus_watch_id_ != 0) {
+        g_source_remove(bus_watch_id_);
+        bus_watch_id_ = 0;
+    }
+
     if (metrics_timer_id_ != 0) {
         g_source_remove(metrics_timer_id_);
         metrics_timer_id_ = 0;
@@ -215,7 +301,6 @@ void ReceiverSession::stop()
         display_convert_ = nullptr;
         display_sink_ = nullptr;
         guard_appsrc_ = nullptr;
-        main_display_valve_ = nullptr;
     }
     if (guard_channel_) {
         g_object_unref(guard_channel_);
@@ -227,7 +312,13 @@ void ReceiverSession::stop()
     guard_frame_ready_ = false;
     using_guard_display_ = false;
     recovery_pending_ = false;
-    main_video_blocked_ = false;
+    recovery_keyframe_accepted_ = false;
+    keyframe_only_mode_ = false;
+    drop_next_idr_after_loss_ = false;
+    low_loss_since_ms_ = 0;
+    last_clean_main_frame_ms_ = 0;
+    decoded_frame_count_ = 0;
+    displayed_frame_count_ = 0;
 }
 
 void ReceiverSession::handle_signaling_message(const SignalingMessage& message)
@@ -372,6 +463,11 @@ bool ReceiverSession::create_display_pipeline()
         return false;
     }
 
+    if (auto* display_convert_src_pad = gst_element_get_static_pad(display_convert_, "src")) {
+        gst_pad_add_probe(display_convert_src_pad, GST_PAD_PROBE_TYPE_BUFFER, &ReceiverSession::on_display_output_probe, this, nullptr);
+        gst_object_unref(display_convert_src_pad);
+    }
+
     guard_selector_pad_ = gst_element_get_request_pad(display_selector_, "sink_%u");
     if (!guard_selector_pad_) {
         Logger::error("无法为 guard 显示链路申请 selector pad。");
@@ -394,6 +490,55 @@ bool ReceiverSession::create_display_pipeline()
 void ReceiverSession::on_incoming_stream(GstElement*, GstPad* pad, gpointer user_data)
 {
     static_cast<ReceiverSession*>(user_data)->link_decode_chain(pad);
+}
+
+gboolean ReceiverSession::on_bus_message(GstBus*, GstMessage* message, gpointer user_data)
+{
+    auto* self = static_cast<ReceiverSession*>(user_data);
+
+    switch (GST_MESSAGE_TYPE(message)) {
+    case GST_MESSAGE_ERROR: {
+        GError* error = nullptr;
+        gchar* debug = nullptr;
+        gst_message_parse_error(message, &error, &debug);
+        Logger::error("接收端 GStreamer 错误: " + std::string(error ? error->message : "未知错误"));
+        if (debug) {
+            Logger::error("接收端 GStreamer 调试信息: " + std::string(debug));
+        }
+        if (self && self->loop_) {
+            g_main_loop_quit(self->loop_);
+        }
+        if (error) {
+            g_error_free(error);
+        }
+        g_free(debug);
+        break;
+    }
+    case GST_MESSAGE_WARNING: {
+        GError* error = nullptr;
+        gchar* debug = nullptr;
+        gst_message_parse_warning(message, &error, &debug);
+        Logger::warn("接收端 GStreamer 警告: " + std::string(error ? error->message : "未知警告"));
+        if (debug) {
+            Logger::warn("接收端 GStreamer 调试信息: " + std::string(debug));
+        }
+        if (error) {
+            g_error_free(error);
+        }
+        g_free(debug);
+        break;
+    }
+    case GST_MESSAGE_EOS:
+        Logger::info("接收端收到 EOS。");
+        if (self && self->loop_) {
+            g_main_loop_quit(self->loop_);
+        }
+        break;
+    default:
+        break;
+    }
+
+    return G_SOURCE_CONTINUE;
 }
 
 void ReceiverSession::on_data_channel(GstElement*, GstWebRTCDataChannel* channel, gpointer user_data)
@@ -420,6 +565,47 @@ void ReceiverSession::on_data_channel(GstElement*, GstWebRTCDataChannel* channel
     Logger::info("receiver attached guard-frame data channel.");
 }
 
+GstPadProbeReturn ReceiverSession::on_encoded_input_probe(GstPad*, GstPadProbeInfo* info, gpointer user_data)
+{
+    auto* self = static_cast<ReceiverSession*>(user_data);
+    if (!self || (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) == 0) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    const auto flags = GST_BUFFER_FLAGS(buffer);
+    if ((flags & GST_BUFFER_FLAG_CORRUPTED) != 0 ||
+        (flags & GST_BUFFER_FLAG_DECODE_ONLY) != 0) {
+        self->enter_damage_free_mode("encoded H.264 buffer was marked corrupted/decode-only");
+        return GST_PAD_PROBE_DROP;
+    }
+
+    if (!self->keyframe_only_mode_) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    if (self->recovery_keyframe_accepted_) {
+        return GST_PAD_PROBE_DROP;
+    }
+
+    const bool is_keyframe = (flags & GST_BUFFER_FLAG_DELTA_UNIT) == 0;
+    if (!is_keyframe || !h264_buffer_contains_idr(buffer)) {
+        return GST_PAD_PROBE_DROP;
+    }
+
+    if (self->drop_next_idr_after_loss_) {
+        self->drop_next_idr_after_loss_ = false;
+        return GST_PAD_PROBE_DROP;
+    }
+
+    self->recovery_keyframe_accepted_ = true;
+    return GST_PAD_PROBE_OK;
+}
+
 GstPadProbeReturn ReceiverSession::on_decoded_input_probe(GstPad*, GstPadProbeInfo* info, gpointer user_data)
 {
     auto* self = static_cast<ReceiverSession*>(user_data);
@@ -435,21 +621,55 @@ GstPadProbeReturn ReceiverSession::on_decoded_input_probe(GstPad*, GstPadProbeIn
     const auto flags = GST_BUFFER_FLAGS(buffer);
     if ((flags & GST_BUFFER_FLAG_CORRUPTED) != 0 ||
         (flags & GST_BUFFER_FLAG_DECODE_ONLY) != 0) {
+        if (self) {
+            self->enter_damage_free_mode("decoded frame was marked corrupted/decode-only");
+        }
         return GST_PAD_PROBE_DROP;
     }
 
-    if (self && self->keyframe_only_mode_ &&
-        (flags & GST_BUFFER_FLAG_DELTA_UNIT) != 0) {
+    // 高丢包无坏帧模式下，恢复授权只由 H.264 parser 输出端决定。
+    // raw video buffer 上的 DELTA_UNIT 标记不稳定，不能用它证明帧可安全显示。
+    if (self && self->keyframe_only_mode_ && !self->recovery_keyframe_accepted_) {
         return GST_PAD_PROBE_DROP;
     }
 
-    if (self && self->recovery_pending_ &&
-        (flags & GST_BUFFER_FLAG_DELTA_UNIT) == 0) {
-        self->recovery_pending_ = false;
-        self->keyframe_only_mode_ = false;
-        self->set_main_video_blocked(false);
+    if (self) {
+        ++self->decoded_frame_count_;
+        if (self->decoded_frame_count_ == 1 || self->decoded_frame_count_ % 120 == 0) {
+            Logger::info("receiver decoded frame count=" + std::to_string(self->decoded_frame_count_));
+        }
+        self->last_clean_main_frame_ms_ = steady_now_ms();
+    }
+
+    if (self && self->recovery_keyframe_accepted_) {
+        self->recovery_keyframe_accepted_ = false;
         self->set_display_mode(false);
-        Logger::info("receiver restored main video after a clean recovery keyframe.");
+
+        if (self->recovery_pending_) {
+            self->recovery_pending_ = false;
+            self->keyframe_only_mode_ = false;
+            Logger::info("receiver restored normal main video after a clean recovery IDR frame.");
+        }
+    }
+
+    return GST_PAD_PROBE_OK;
+}
+
+GstPadProbeReturn ReceiverSession::on_display_output_probe(GstPad*, GstPadProbeInfo* info, gpointer user_data)
+{
+    auto* self = static_cast<ReceiverSession*>(user_data);
+    if (!self || (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) == 0) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    ++self->displayed_frame_count_;
+    if (self->displayed_frame_count_ == 1 || self->displayed_frame_count_ % 120 == 0) {
+        Logger::info("receiver display-path frame count=" + std::to_string(self->displayed_frame_count_));
     }
 
     return GST_PAD_PROBE_OK;
@@ -473,7 +693,10 @@ GstPadProbeReturn ReceiverSession::on_rtp_event_probe(GstPad*, GstPadProbeInfo* 
 
     const auto* name = gst_structure_get_name(structure);
     if (name && std::string(name) == "GstRTPPacketLost") {
-        (void)user_data;
+        auto* self = static_cast<ReceiverSession*>(user_data);
+        if (self) {
+            self->enter_damage_free_mode("RTP packet loss was reported by jitterbuffer");
+        }
     }
 
     return GST_PAD_PROBE_OK;
@@ -490,14 +713,12 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
     auto* depay = gst_element_factory_make("rtph264depay", nullptr);
     auto* parse = gst_element_factory_make("h264parse", nullptr);
     auto* decoder = gst_element_factory_make("avdec_h264", nullptr);
-    auto* valve = gst_element_factory_make("valve", nullptr);
     auto* convert = gst_element_factory_make("videoconvert", nullptr);
 
-    if (!queue || !depay || !parse || !decoder || !valve || !convert || !display_selector_) {
+    if (!queue || !depay || !parse || !decoder || !convert || !display_selector_) {
         Logger::error("创建接收端解码链路失败，请确认 libav/good/bad 插件已安装。");
         return;
     }
-    main_display_valve_ = valve;
 
     set_boolean_property_if_present(depay, "request-keyframe", TRUE);
     set_boolean_property_if_present(depay, "wait-for-keyframe", TRUE);
@@ -505,6 +726,11 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
     set_boolean_property_if_present(parse, "disable-passthrough", TRUE);
     set_boolean_property_if_present(decoder, "output-corrupt", FALSE);
     set_boolean_property_if_present(decoder, "discard-corrupted-frames", TRUE);
+
+    if (auto* parse_src_pad = gst_element_get_static_pad(parse, "src")) {
+        gst_pad_add_probe(parse_src_pad, GST_PAD_PROBE_TYPE_BUFFER, &ReceiverSession::on_encoded_input_probe, this, nullptr);
+        gst_object_unref(parse_src_pad);
+    }
 
     if (auto* decoder_src_pad = gst_element_get_static_pad(decoder, "src")) {
         gst_pad_add_probe(decoder_src_pad, GST_PAD_PROBE_TYPE_BUFFER, &ReceiverSession::on_decoded_input_probe, this, nullptr);
@@ -526,28 +752,26 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
             gst_object_unref(jitter_src_pad);
         }
 
-        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, valve, convert, nullptr);
+        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, convert, nullptr);
         gst_element_sync_state_with_parent(queue);
         gst_element_sync_state_with_parent(depay);
         gst_element_sync_state_with_parent(parse);
         gst_element_sync_state_with_parent(decoder);
-        gst_element_sync_state_with_parent(valve);
         gst_element_sync_state_with_parent(convert);
 
-        if (!gst_element_link_many(queue, jitterbuffer, depay, parse, decoder, valve, convert, nullptr)) {
+        if (!gst_element_link_many(queue, jitterbuffer, depay, parse, decoder, convert, nullptr)) {
             Logger::error("接收端解码链路连接失败。");
             return;
         }
     } else {
-        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, valve, convert, nullptr);
+        gst_bin_add_many(GST_BIN(pipeline_), queue, depay, parse, decoder, convert, nullptr);
         gst_element_sync_state_with_parent(queue);
         gst_element_sync_state_with_parent(depay);
         gst_element_sync_state_with_parent(parse);
         gst_element_sync_state_with_parent(decoder);
-        gst_element_sync_state_with_parent(valve);
         gst_element_sync_state_with_parent(convert);
 
-        if (!gst_element_link_many(queue, depay, parse, decoder, valve, convert, nullptr)) {
+        if (!gst_element_link_many(queue, depay, parse, decoder, convert, nullptr)) {
             Logger::error("接收端解码链路连接失败。");
             return;
         }
@@ -588,19 +812,29 @@ void ReceiverSession::link_decode_chain(GstPad* pad)
     gst_object_unref(sink_pad);
 }
 
+void ReceiverSession::enter_damage_free_mode(const char* reason)
+{
+    low_loss_since_ms_ = 0;
+    recovery_pending_ = false;
+    recovery_keyframe_accepted_ = false;
+    drop_next_idr_after_loss_ = true;
+
+    if (!keyframe_only_mode_) {
+        keyframe_only_mode_ = true;
+        Logger::warn(std::string("receiver enters damage-free mode: ") +
+                     (reason ? reason : "packet loss exceeded safe threshold") +
+                     "; only complete IDR frames and verified guard frames are allowed.");
+    }
+
+    if (guard_frame_ready_) {
+        set_display_mode(true);
+    }
+}
+
 void ReceiverSession::update_keyframe_only_mode(double packet_loss_ratio, std::int64_t now_ms)
 {
     if (packet_loss_ratio > kDamageFreeModeEnableLossThreshold) {
-        low_loss_since_ms_ = 0;
-        recovery_pending_ = false;
-        if (!keyframe_only_mode_) {
-            keyframe_only_mode_ = true;
-            set_main_video_blocked(true);
-            Logger::warn("receiver enters guard-only mode: the main H.264 display is blocked while loss stays above 10%.");
-            if (guard_frame_ready_) {
-                set_display_mode(true);
-            }
-        }
+        enter_damage_free_mode("packet loss ratio stayed above 10%");
         return;
     }
 
@@ -618,6 +852,10 @@ void ReceiverSession::update_keyframe_only_mode(double packet_loss_ratio, std::i
         return;
     }
 
+    if (guard_frame_ready_ && keyframe_only_mode_) {
+        set_display_mode(true);
+    }
+
     if (low_loss_since_ms_ == 0) {
         low_loss_since_ms_ = now_ms;
         return;
@@ -626,6 +864,7 @@ void ReceiverSession::update_keyframe_only_mode(double packet_loss_ratio, std::i
     if (now_ms - low_loss_since_ms_ >= static_cast<std::int64_t>(config_.upshift_window_ms)) {
         low_loss_since_ms_ = 0;
         recovery_pending_ = true;
+        recovery_keyframe_accepted_ = false;
         Logger::info("receiver is waiting for a clean recovery keyframe before restoring the main video.");
     }
 }
@@ -722,18 +961,21 @@ void ReceiverSession::set_display_mode(bool use_guard)
         return;
     }
 
-    g_object_set(display_selector_, "active-pad", target_pad, nullptr);
-    using_guard_display_ = use_guard;
-}
+    GstPad* active_pad = nullptr;
+    g_object_get(display_selector_, "active-pad", &active_pad, nullptr);
+    const bool already_active = active_pad == target_pad;
+    if (active_pad) {
+        gst_object_unref(active_pad);
+    }
 
-void ReceiverSession::set_main_video_blocked(bool blocked)
-{
-    if (!main_display_valve_ || main_video_blocked_ == blocked) {
+    if (already_active) {
+        using_guard_display_ = use_guard;
         return;
     }
 
-    g_object_set(main_display_valve_, "drop", blocked ? TRUE : FALSE, nullptr);
-    main_video_blocked_ = blocked;
+    g_object_set(display_selector_, "active-pad", target_pad, nullptr);
+    using_guard_display_ = use_guard;
+    Logger::info(std::string("receiver switched display to ") + (use_guard ? "guard" : "main") + " path.");
 }
 
 void ReceiverSession::cleanup_stale_guard_frames(std::uint32_t newest_frame_id)

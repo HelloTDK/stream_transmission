@@ -299,33 +299,49 @@ void SenderSession::apply_profile(const EncoderProfile& profile)
         return;
     }
 
-    apply_bitrate(profile.bitrate_kbps);
+    if (applied_bitrate_kbps_ != profile.bitrate_kbps) {
+        apply_bitrate(profile.bitrate_kbps);
+        applied_bitrate_kbps_ = profile.bitrate_kbps;
+    }
 
-    auto* caps = gst_caps_new_simple(
-        "video/x-raw",
-        "width", G_TYPE_INT, static_cast<int>(profile.width),
-        "height", G_TYPE_INT, static_cast<int>(profile.height),
-        "framerate", GST_TYPE_FRACTION, static_cast<int>(profile.fps), 1,
-        nullptr);
+    const bool caps_changed = applied_width_ == 0 ||
+        applied_height_ == 0 ||
+        applied_fps_ == 0;
+    if (caps_changed) {
+        auto* caps = gst_caps_new_simple(
+            "video/x-raw",
+            "width", G_TYPE_INT, static_cast<int>(profile.width),
+            "height", G_TYPE_INT, static_cast<int>(profile.height),
+            "framerate", GST_TYPE_FRACTION, static_cast<int>(profile.fps), 1,
+            nullptr);
 
-    g_object_set(capsfilter_, "caps", caps, nullptr);
-    gst_caps_unref(caps);
+        g_object_set(capsfilter_, "caps", caps, nullptr);
+        gst_caps_unref(caps);
+        applied_width_ = profile.width;
+        applied_height_ = profile.height;
+        applied_fps_ = profile.fps;
+    }
 
     if (config_.video_encoder == "x264enc") {
         apply_x264_damage_free_mode(profile);
     }
 
-    set_uint_property_if_present(
-        payloader_,
-        "mtu",
-        damage_free_mode_ ? config_.damage_free_rtp_mtu_bytes : config_.rtp_mtu_bytes);
+    const auto payloader_mtu = damage_free_mode_ ? config_.damage_free_rtp_mtu_bytes : config_.rtp_mtu_bytes;
+    if (applied_payloader_mtu_ != payloader_mtu) {
+        set_uint_property_if_present(payloader_, "mtu", payloader_mtu);
+        applied_payloader_mtu_ = payloader_mtu;
+    }
 
-    Logger::info(
-        "自适应档位=" + AdaptiveController::grade_to_string(profile.grade) +
-        " 码率=" + std::to_string(profile.bitrate_kbps) + "kbps" +
-        " 分辨率=" + std::to_string(profile.width) + "x" + std::to_string(profile.height) +
-        " 帧率=" + std::to_string(profile.fps) +
-        (profile.enable_guard_stream ? " 建议启用保底图像通道" : ""));
+    const auto effective_keyframe_interval = damage_free_mode_ ? 1u : profile.keyframe_interval;
+    if (caps_changed || applied_keyframe_interval_ != effective_keyframe_interval) {
+        Logger::info(
+            "自适应档位=" + AdaptiveController::grade_to_string(profile.grade) +
+            " 码率=" + std::to_string(profile.bitrate_kbps) + "kbps" +
+            " 目标分辨率=" + std::to_string(profile.width) + "x" + std::to_string(profile.height) +
+            " 目标帧率=" + std::to_string(profile.fps) +
+            " 当前保持启动 caps 以避免 RTSP 重新协商" +
+            (profile.enable_guard_stream ? " 建议启用保底图像通道" : ""));
+    }
 }
 
 void SenderSession::apply_bitrate(std::uint32_t bitrate_kbps)
@@ -351,6 +367,7 @@ void SenderSession::update_damage_free_mode(double packet_loss_ratio)
         damage_free_mode_ = true;
         low_loss_since_ms_ = 0;
         Logger::warn("loss > 10%, sender switches to damage-free mode: every frame is encoded as an independent keyframe.");
+        apply_profile(adaptive_.current_profile());
         request_keyframe();
         return;
     }
@@ -375,6 +392,7 @@ void SenderSession::update_damage_free_mode(double packet_loss_ratio)
         damage_free_mode_ = false;
         low_loss_since_ms_ = 0;
         Logger::info("packet loss has stayed below 10%; sender restores the normal H.264 inter-frame strategy.");
+        apply_profile(adaptive_.current_profile());
         request_keyframe();
     }
 }
@@ -392,18 +410,23 @@ void SenderSession::apply_x264_damage_free_mode(const EncoderProfile& profile)
         ? config_.damage_free_rtp_mtu_bytes - 128
         : 0u;
 
-    set_uint_property_if_present(encoder_, "key-int-max", key_interval);
-    set_uint_property_if_present(encoder_, "bframes", 0);
+    if (applied_keyframe_interval_ != key_interval) {
+        set_uint_property_if_present(encoder_, "key-int-max", key_interval);
+        applied_keyframe_interval_ = key_interval;
+    }
+    if (!x264_static_options_applied_) {
+        set_uint_property_if_present(encoder_, "bframes", 0);
+        set_boolean_property_if_present(encoder_, "intra-refresh", FALSE);
+        x264_static_options_applied_ = true;
+    }
     if (slice_max_size > 0) {
         set_uint_property_if_present(encoder_, "slice-max-size", slice_max_size);
     }
 
     if (damage_free_mode_) {
         set_uint_property_if_present(encoder_, "ref", 1);
-        set_boolean_property_if_present(encoder_, "intra-refresh", FALSE);
     } else {
         set_uint_property_if_present(encoder_, "ref", 3);
-        set_boolean_property_if_present(encoder_, "intra-refresh", FALSE);
         set_uint_property_if_present(encoder_, "slice-max-size", 0);
     }
 }
@@ -416,7 +439,8 @@ void SenderSession::create_guard_data_channel()
 
     GstStructure* options = gst_structure_new_empty("guard-data-channel-options");
     gst_structure_set(options,
-                      "ordered", G_TYPE_BOOLEAN, TRUE,
+                      "ordered", G_TYPE_BOOLEAN, FALSE,
+                      "max-retransmits", G_TYPE_INT, 0,
                       nullptr);
 
     GstWebRTCDataChannel* channel = nullptr;
@@ -592,7 +616,14 @@ gboolean SenderSession::on_bus_message(GstBus*, GstMessage* message, gpointer us
         if (debug) {
             Logger::error("发送端 GStreamer 调试信息: " + std::string(debug));
         }
-        if (self->loop_) {
+        const std::string error_text = error ? error->message : "";
+        const std::string debug_text = debug ? debug : "";
+        const bool is_rtsp_not_negotiated =
+            error_text.find("not-negotiated") != std::string::npos ||
+            debug_text.find("not-negotiated") != std::string::npos;
+        if (is_rtsp_not_negotiated) {
+            Logger::warn("发送端忽略一次 RTSP not-negotiated 错误，保持会话运行；请确认运行时不再动态改 RTSP 源 caps。");
+        } else if (self->loop_) {
             g_main_loop_quit(self->loop_);
         }
         if (error) {
